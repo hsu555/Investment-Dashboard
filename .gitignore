@@ -13,7 +13,10 @@ ENV/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.yfinance-cache/
 *.log
+streamlit.start.out
+streamlit.start.err
 
 .DS_Store
 Thumbs.db

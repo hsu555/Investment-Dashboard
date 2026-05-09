@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from html import escape
 from pathlib import Path
 
 import pandas as pd
@@ -9,18 +10,30 @@ import streamlit as st
 from src.analytics import (
     growth_curve,
     metrics_table,
+    technical_indicators,
+    technical_signal_table,
     yearly_dividends,
 )
-from src.charts import allocation_pie, comparison_chart, dividend_chart, growth_chart
-from src.config import DEFAULT_TICKERS, TICKER_DISPLAY_NAMES
+from src.charts import (
+    allocation_pie,
+    comparison_chart,
+    dividend_chart,
+    growth_chart,
+    momentum_chart,
+    technical_price_chart,
+)
+from src.config import DEFAULT_TICKERS
 from src.data import (
     load_dividends,
     load_fx_rate,
     load_history,
     load_news,
+    load_ohlcv_history,
     load_quotes,
+    load_security_profile,
 )
 from src.formatting import fmt_currency, fmt_percent, fmt_signed
+from src.names import ticker_display_name
 
 
 PORTFOLIO_FILE = Path(__file__).with_name("portfolio.json")
@@ -155,6 +168,262 @@ def percent_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return df.map(lambda value: fmt_percent(value) if pd.notna(value) else "N/A")
 
 
+def fmt_number(value: float | None, digits: int = 2) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    return f"{float(value):,.{digits}f}"
+
+
+def fmt_compact(value: float | None, currency: str | None = None) -> str:
+    if value is None or pd.isna(value):
+        return "N/A"
+    amount = float(value)
+    abs_amount = abs(amount)
+    units = [
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ]
+    prefix = f"{currency} " if currency else ""
+    for divisor, suffix in units:
+        if abs_amount >= divisor:
+            return f"{prefix}{amount / divisor:,.2f}{suffix}"
+    return f"{prefix}{amount:,.2f}"
+
+
+def value_or_fallback(*values):
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, float) and pd.isna(value):
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
+def add_display_name_column(df: pd.DataFrame, quotes) -> pd.DataFrame:
+    display = df.copy()
+    display.insert(
+        0,
+        "名稱",
+        [ticker_display_name(str(ticker), quotes.get(str(ticker))) for ticker in display.index],
+    )
+    return display
+
+
+def latest_indicator_value(indicators: pd.DataFrame, column: str) -> float | None:
+    if indicators.empty or column not in indicators:
+        return None
+    values = indicators[column].dropna()
+    return float(values.iloc[-1]) if not values.empty else None
+
+
+def resample_ohlcv(history: pd.DataFrame, frequency: str) -> pd.DataFrame:
+    if history.empty:
+        return history
+
+    columns = {
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }
+    available = {column: method for column, method in columns.items() if column in history}
+    return history.resample(frequency).agg(available).dropna(subset=["Close"])
+
+
+def filter_prices_by_years(prices: pd.DataFrame, years: int) -> pd.DataFrame:
+    if prices.empty:
+        return prices
+    end = prices.dropna(how="all").index.max()
+    if pd.isna(end):
+        return prices
+    start = end - pd.DateOffset(years=years)
+    return prices.loc[prices.index >= start]
+
+
+def security_summary_signal(profile, quote, indicators: pd.DataFrame) -> str:
+    clean = indicators.dropna(subset=["Close"]) if not indicators.empty else pd.DataFrame()
+    latest = clean.iloc[-1] if not clean.empty else {}
+    close = latest.get("Close") if hasattr(latest, "get") else None
+    ma20 = latest.get("MA20") if hasattr(latest, "get") else None
+    ma60 = latest.get("MA60") if hasattr(latest, "get") else None
+    rsi = latest.get("RSI14") if hasattr(latest, "get") else None
+
+    valuation = "估值資料不足"
+    if profile.trailing_pe:
+        valuation = "估值偏高" if profile.trailing_pe >= 30 else "估值合理" if profile.trailing_pe >= 12 else "估值偏低"
+    elif profile.expense_ratio:
+        valuation = f"費用率 {fmt_percent(profile.expense_ratio)}"
+
+    trend = "趨勢資料不足"
+    if pd.notna(close) and pd.notna(ma20) and pd.notna(ma60):
+        trend = "短中期趨勢偏多" if close > ma20 > ma60 else "短中期趨勢偏弱" if close < ma20 < ma60 else "短中期盤整"
+
+    momentum = "動能中性"
+    if pd.notna(rsi):
+        momentum = "RSI 偏熱" if rsi >= 70 else "RSI 偏弱" if rsi <= 30 else "動能中性"
+
+    name = ticker_display_name(profile.ticker, quote)
+    return f"{name} 目前呈現{trend}，{valuation}，{momentum}。"
+
+
+def history_profile_stats(history: pd.DataFrame) -> dict[str, float | None]:
+    if history.empty or "Close" not in history:
+        return {"fifty_two_week_low": None, "fifty_two_week_high": None, "average_volume": None}
+
+    recent = history.tail(252)
+    stats = {
+        "fifty_two_week_low": float(recent["Close"].min()) if not recent["Close"].dropna().empty else None,
+        "fifty_two_week_high": float(recent["Close"].max()) if not recent["Close"].dropna().empty else None,
+        "average_volume": None,
+    }
+    if "Volume" in recent and not recent["Volume"].dropna().empty:
+        stats["average_volume"] = float(recent["Volume"].tail(60).mean())
+    return stats
+
+
+def profile_table(profile, quote=None, history_stats: dict[str, float | None] | None = None) -> pd.DataFrame:
+    history_stats = history_stats or {}
+    is_fund = (profile.quote_type or "").upper() in {"ETF", "MUTUALFUND"} or profile.expense_ratio is not None
+    currency = value_or_fallback(profile.currency, getattr(quote, "currency", None), "TWD" if profile.ticker.endswith(".TW") else "USD")
+    low_52w = value_or_fallback(profile.fifty_two_week_low, history_stats.get("fifty_two_week_low"))
+    high_52w = value_or_fallback(profile.fifty_two_week_high, history_stats.get("fifty_two_week_high"))
+    average_volume = value_or_fallback(profile.average_volume, history_stats.get("average_volume"))
+    fields = [
+        ("名稱", value_or_fallback(profile.long_name, profile.short_name)),
+        ("代號", profile.ticker),
+        ("類型", profile.quote_type),
+        ("交易所", profile.exchange),
+        ("幣別", currency),
+        ("52週低點", fmt_currency(low_52w, currency)),
+        ("52週高點", fmt_currency(high_52w, currency)),
+        ("平均成交量", fmt_compact(average_volume)),
+    ]
+    if is_fund:
+        fields.extend(
+            [
+                ("基金公司", profile.fund_family),
+                ("分類", profile.category),
+                ("總資產", fmt_compact(profile.total_assets, currency)),
+                ("費用率", fmt_percent(profile.expense_ratio)),
+                ("NAV", fmt_currency(profile.nav_price, currency)),
+                ("配息率", fmt_percent(profile.dividend_yield)),
+            ]
+        )
+    else:
+        fields.extend(
+            [
+                ("產業", profile.sector),
+                ("細分產業", profile.industry),
+                ("市值", fmt_compact(profile.market_cap, currency)),
+                ("Trailing P/E", fmt_number(profile.trailing_pe)),
+                ("Forward P/E", fmt_number(profile.forward_pe)),
+                ("P/B", fmt_number(profile.price_to_book)),
+                ("EPS", fmt_number(profile.trailing_eps)),
+                ("Beta", fmt_number(profile.beta)),
+                ("配息率", fmt_percent(profile.dividend_yield)),
+            ]
+        )
+    rows = [{"項目": label, "資料": value if value not in (None, "") else "N/A"} for label, value in fields]
+    return pd.DataFrame(rows)
+
+
+def format_signal_table(signals: pd.DataFrame) -> pd.DataFrame:
+    if signals.empty:
+        return signals
+    formatted = signals.copy()
+    formatted["數值"] = formatted["數值"].map(
+        lambda value: fmt_percent(value) if pd.notna(value) and abs(float(value)) <= 2 else fmt_number(value)
+    )
+    return formatted
+
+
+def render_security_analysis(
+    selected: list[str],
+    quotes,
+    holdings_summary: pd.DataFrame,
+) -> None:
+    st.subheader("個股 / ETF 分析")
+    choices = list(dict.fromkeys(selected + ["AAPL", "TSLA", "SPY", "QQQ", "0050.TW", "2330.TW"]))
+    default_ticker = selected[0] if selected else choices[0]
+    cols = st.columns([0.35, 0.65])
+    picked = cols[0].selectbox("選擇追蹤標的", choices, index=choices.index(default_ticker))
+    manual = cols[1].text_input("或輸入 Yahoo Finance 代號", value=picked, placeholder="例如 AAPL、SPY、2330.TW")
+    ticker = manual.strip().upper() or picked
+
+    with st.spinner(f"正在載入 {ticker} 個股分析資料..."):
+        profile = load_security_profile(ticker)
+        quote_map = quotes if ticker in quotes else load_quotes((ticker,))
+        quote = quote_map.get(ticker)
+        daily_history = load_ohlcv_history(ticker, period="20y")
+
+    if daily_history.empty:
+        st.warning("目前無法取得這個標的的歷史價格，請確認代號是否符合 Yahoo Finance 格式。")
+        return
+
+    daily_indicators = technical_indicators(daily_history)
+    latest_close = latest_indicator_value(daily_indicators, "Close")
+    latest_rsi = latest_indicator_value(daily_indicators, "RSI14")
+    latest_atr = latest_indicator_value(daily_indicators, "ATR14")
+    history_stats = history_profile_stats(daily_history)
+    low_52w = value_or_fallback(profile.fifty_two_week_low, history_stats.get("fifty_two_week_low"))
+    high_52w = value_or_fallback(profile.fifty_two_week_high, history_stats.get("fifty_two_week_high"))
+    currency = value_or_fallback((quote.currency if quote else None), profile.currency, "TWD" if ticker.endswith(".TW") else "USD")
+    day_change = quote.day_change if quote else None
+    day_change_pct = quote.day_change_pct if quote else None
+
+    st.caption(security_summary_signal(profile, quote, daily_indicators))
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("現價", fmt_currency(latest_close or (quote.price if quote else None), currency), fmt_signed(day_change) if day_change is not None else None)
+    metric_cols[1].metric("日漲跌幅", fmt_percent(day_change_pct))
+    metric_cols[2].metric("52 週區間", f"{fmt_number(low_52w)} - {fmt_number(high_52w)}")
+    metric_cols[3].metric("市值 / 資產", fmt_compact(profile.market_cap or profile.total_assets, currency))
+    metric_cols[4].metric("P/E 或費用率", fmt_number(profile.trailing_pe) if profile.trailing_pe else fmt_percent(profile.expense_ratio))
+    metric_cols[5].metric("RSI / ATR", f"{fmt_number(latest_rsi)} / {fmt_number(latest_atr)}")
+
+    position = holdings_summary.loc[[ticker]] if ticker in holdings_summary.index else pd.DataFrame()
+    if not position.empty:
+        row = position.iloc[0]
+        st.info(
+            f"此標的已在追蹤清單中：數量 {fmt_number(row['數量'], 0)}，"
+            f"未實現損益 {fmt_currency(row['未實現損益(TWD)'], 'TWD')}，"
+            f"配置比例 {fmt_percent(row['配置比例'])}。"
+        )
+
+    info_col, signal_col = st.columns([0.42, 0.58])
+    with info_col:
+        st.markdown("##### 基本面資料")
+        st.dataframe(profile_table(profile, quote, history_stats), hide_index=True, width="stretch", height=400)
+    with signal_col:
+        st.markdown("##### 技術分析指標")
+        signals = technical_signal_table(daily_indicators)
+        st.dataframe(format_signal_table(signals), hide_index=True, width="stretch", height=360)
+
+    chart_tabs = st.tabs(["日線", "週線", "月線", "動能"])
+    periods = [
+        ("日線", daily_indicators.tail(260)),
+        ("週線", technical_indicators(resample_ohlcv(daily_history, "W-FRI")).tail(260)),
+        ("月線", technical_indicators(resample_ohlcv(daily_history, "ME")).tail(240)),
+    ]
+    for tab, (label, indicator_frame) in zip(chart_tabs[:3], periods):
+        with tab:
+            st.plotly_chart(
+                technical_price_chart(indicator_frame, ticker, f"{ticker} {label}價格、均線與量能"),
+                width="stretch",
+            )
+    with chart_tabs[3]:
+        st.plotly_chart(momentum_chart(daily_indicators.tail(260), f"{ticker} RSI / MACD"), width="stretch")
+
+    if profile.summary:
+        with st.expander("公司 / ETF 摘要"):
+            st.write(profile.summary)
+
+
 def render_sidebar() -> pd.DataFrame:
     st.sidebar.title("追蹤清單")
     if "holdings" not in st.session_state:
@@ -243,6 +512,7 @@ def render_holdings_summary(holdings: pd.DataFrame, quotes, fx_rate: float | Non
         unrealized_return = unrealized_gain / cost if unrealized_gain is not None and cost not in (None, 0) else None
         rows.append(
             {
+                "名稱": ticker_display_name(row.ticker, quote),
                 "標的": row.ticker,
                 "幣別": currency,
                 "數量": quantity,
@@ -263,7 +533,7 @@ def render_ticker_cards(selected: list[str], quotes) -> None:
     st.sidebar.subheader("即時價格")
     for ticker in selected:
         quote = quotes.get(ticker)
-        name = TICKER_DISPLAY_NAMES.get(ticker) or (quote.long_name if quote else ticker)
+        name = ticker_display_name(ticker, quote)
         price = fmt_currency(quote.price, quote.currency) if quote else "N/A"
         change = fmt_signed(quote.day_change) if quote else "N/A"
         change_pct = fmt_percent(quote.day_change_pct) if quote else "N/A"
@@ -271,10 +541,10 @@ def render_ticker_cards(selected: list[str], quotes) -> None:
         st.sidebar.markdown(
             f"""
             <div class="ticker-card">
-                <strong>{ticker}</strong><br>
-                <span>{name}</span><br>
-                <div style="margin-top:6px;">{price}</div>
-                <div style="color:{color}; font-size:0.86rem;">{change} ({change_pct})</div>
+                <strong>{escape(ticker)}</strong><br>
+                <span>{escape(name)}</span><br>
+                <div style="margin-top:6px;">{escape(price)}</div>
+                <div style="color:{color}; font-size:0.86rem;">{escape(change)} ({escape(change_pct)})</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -324,6 +594,7 @@ def render_dividend_summary(selected: list[str], quotes, dividends: dict[str, pd
         )
         rows.append(
             {
+                "名稱": ticker_display_name(ticker, quote),
                 "標的": ticker,
                 "幣別": currency,
                 "Trailing Annual Dividend": trailing_dividend,
@@ -368,7 +639,7 @@ def main() -> None:
 
     with st.spinner("正在更新 Yahoo Finance 資料..."):
         tickers = tuple(selected)
-        prices = load_history(tickers)
+        prices = load_history(tickers, period="20y")
         quotes = load_quotes(tickers)
         dividends = {ticker: load_dividends(ticker) for ticker in selected}
         fx_rate = load_fx_rate()
@@ -395,7 +666,9 @@ def main() -> None:
 
     render_position_metrics(held_summary, fx_rate)
 
-    tab_holdings, tab_observation, tab_dividends, tab_news = st.tabs(["持有資產", "觀察指標", "配息資訊", "新聞摘要"])
+    tab_holdings, tab_observation, tab_security, tab_dividends, tab_news = st.tabs(
+        ["持有資產", "觀察指標", "個股分析", "配息資訊", "新聞摘要"]
+    )
 
     with tab_holdings:
         if held_summary.empty:
@@ -426,22 +699,37 @@ def main() -> None:
             st.subheader("持有標的歷史指標")
             display_held_metrics = held_metrics.copy()
             st.dataframe(
-                percent_dataframe(display_held_metrics),
+                add_display_name_column(percent_dataframe(display_held_metrics), quotes),
                 width="stretch",
                 height=240,
             )
 
     with tab_observation:
-        observation_growth = growth
-        st.plotly_chart(growth_chart(observation_growth, observation_metrics), width="stretch")
+        growth_window = st.radio(
+            "成長曲線期間",
+            options=["1年", "5年", "20年"],
+            index=1,
+            horizontal=True,
+        )
+        growth_years = {"1年": 1, "5年": 5, "20年": 20}[growth_window]
+        observation_prices = filter_prices_by_years(prices, growth_years)
+        observation_growth = growth_curve(observation_prices)
+        observation_window_metrics = metrics_table(observation_prices)
+        st.plotly_chart(
+            growth_chart(observation_growth, observation_window_metrics, title=f"成長曲線：近 {growth_window}"),
+            width="stretch",
+        )
         st.plotly_chart(comparison_chart(observation_metrics), width="stretch")
         st.subheader("追蹤標的歷史指標")
         display_metrics = observation_metrics.copy()
         st.dataframe(
-            percent_dataframe(display_metrics),
+            add_display_name_column(percent_dataframe(display_metrics), quotes),
             width="stretch",
             height=300,
         )
+
+    with tab_security:
+        render_security_analysis(selected, quotes, holdings_summary)
 
     with tab_dividends:
         summary = render_dividend_summary(selected, quotes, dividends)
