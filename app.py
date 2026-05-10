@@ -116,6 +116,27 @@ st.markdown(
         background: #111827;
         border-right: 1px solid rgba(148, 163, 184, 0.18);
     }
+    section[data-testid="stSidebar"] > div {
+        padding-top: 0.45rem;
+    }
+    div[data-testid="stSidebarUserContent"] {
+        padding-top: 0.2rem !important;
+    }
+    div[data-testid="stSidebarHeader"] {
+        height: 0 !important;
+        min-height: 0 !important;
+        padding: 0 !important;
+    }
+    div[data-testid="stSidebarHeader"] button {
+        position: absolute;
+        right: 0.4rem;
+        top: 0.35rem;
+        z-index: 2;
+    }
+    section[data-testid="stSidebar"] h1 {
+        margin-top: 0;
+        margin-bottom: 0.35rem;
+    }
     div[data-testid="stMetric"] {
         background: #111827;
         border: 1px solid rgba(148, 163, 184, 0.16);
@@ -125,24 +146,101 @@ st.markdown(
     div[data-testid="stMetricValue"] {
         font-size: 1.55rem;
     }
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] {
+        background: rgba(17, 24, 39, 0.48);
+    }
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] > div {
+        padding: 5px 8px 6px;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {
+        gap: 0.42rem;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+        gap: 0 !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="column"] {
+        flex-shrink: 1 !important;
+        min-width: 0 !important;
+        overflow: hidden;
+        padding: 0 3px !important;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stTextInput"],
+    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] {
+        min-width: 0;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stTextInput"] input,
+    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] input {
+        line-height: 1.2;
+        min-height: 34px;
+        padding: 2px 6px;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stTextInput"] input {
+        font-size: 0.95rem;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] input {
+        font-size: 0.9rem;
+    }
+    section[data-testid="stSidebar"] div[data-baseweb="input"] {
+        min-height: 34px;
+    }
+    section[data-testid="stSidebar"] div[data-baseweb="input"] > div {
+        min-height: 34px;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] button {
+        display: none;
+    }
+    section[data-testid="stSidebar"] button[kind="secondary"] {
+        min-height: 34px;
+        padding: 2px 8px;
+    }
+    section[data-testid="stSidebar"] button[kind="tertiary"] {
+        font-size: 0.78rem;
+        min-height: 28px;
+        min-width: 20px;
+        padding: 0 1px;
+        white-space: nowrap;
+    }
+    .sidebar-row-guide {
+        color: #94a3b8;
+        display: grid;
+        font-size: 0.76rem;
+        gap: 0;
+        grid-template-columns: 1.2fr 0.8fr 0.86fr;
+        margin: 0 0 4px;
+    }
+    .sidebar-action-line {
+        align-items: center;
+        color: #cbd5e1;
+        display: flex;
+        font-size: 0.78rem;
+        gap: 8px;
+        line-height: 1.25;
+        margin-top: 0;
+        min-width: 0;
+    }
+    .sidebar-action-line .market {
+        flex: 1 1 auto;
+        font-size: 0.92rem;
+        font-weight: 700;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .sidebar-action-line .positive {
+        color: #22c55e;
+    }
+    .sidebar-action-line .negative {
+        color: #fb7185;
+    }
+    .sidebar-action-line .muted {
+        color: #94a3b8;
+    }
     .block-container {
         padding-top: 1.4rem;
         padding-bottom: 2rem;
         max-width: 1560px;
-    }
-    .ticker-card {
-        padding: 10px 12px;
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        border-radius: 8px;
-        background: rgba(17, 24, 39, 0.82);
-        margin-bottom: 8px;
-    }
-    .ticker-card strong {
-        font-size: 0.95rem;
-    }
-    .ticker-card span {
-        color: #94a3b8;
-        font-size: 0.8rem;
     }
     .news-item {
         border-bottom: 1px solid rgba(148, 163, 184, 0.16);
@@ -212,6 +310,27 @@ def add_display_name_column(df: pd.DataFrame, quotes) -> pd.DataFrame:
         [ticker_display_name(str(ticker), quotes.get(str(ticker))) for ticker in display.index],
     )
     return display
+
+
+def sidebar_market_summary_html(ticker: str, quote) -> str:
+    if quote is None:
+        return (
+            '<div class="sidebar-action-line">'
+            '<span class="market muted">現價 N/A / 漲跌 N/A</span>'
+            "</div>"
+        )
+
+    currency = quote_currency(ticker, quote)
+    price = fmt_currency(quote.price, currency)
+    change = fmt_signed(quote.day_change)
+    change_pct = fmt_percent(quote.day_change_pct)
+    direction = "positive" if quote.day_change is not None and quote.day_change >= 0 else "negative"
+    return (
+        '<div class="sidebar-action-line">'
+        f'<span class="market">{escape(price)} '
+        f'<span class="{direction}">{escape(change)} ({escape(change_pct)})</span></span>'
+        "</div>"
+    )
 
 
 def latest_indicator_value(indicators: pd.DataFrame, column: str) -> float | None:
@@ -349,7 +468,7 @@ def render_security_analysis(
     holdings_summary: pd.DataFrame,
 ) -> None:
     st.subheader("個股 / ETF 分析")
-    choices = list(dict.fromkeys(selected + ["AAPL", "TSLA", "SPY", "QQQ", "0050.TW", "2330.TW"]))
+    choices = selected
     default_ticker = selected[0] if selected else choices[0]
     cols = st.columns([0.35, 0.65])
     picked = cols[0].selectbox("選擇追蹤標的", choices, index=choices.index(default_ticker))
@@ -424,28 +543,135 @@ def render_security_analysis(
             st.write(profile.summary)
 
 
-def render_sidebar() -> pd.DataFrame:
+def render_sidebar() -> tuple[pd.DataFrame, dict]:
     st.sidebar.title("追蹤清單")
     if "holdings" not in st.session_state:
         st.session_state.holdings = load_holdings()
 
-    st.sidebar.caption("數量填 0 代表只觀察，不列入持有資產。買入價請輸入該標的原幣別價格。")
-    edited = st.sidebar.data_editor(
-        st.session_state.holdings,
-        column_config={
-            "order": st.column_config.NumberColumn("序號", min_value=1, step=1, format="%d"),
-            "ticker": st.column_config.TextColumn("標的代號", help="Yahoo Finance 代號，例如 AAPL、TSLA、2330.TW。"),
-            "quantity": st.column_config.NumberColumn("數量", min_value=0, step=1, format="%d"),
-            "purchase_price": st.column_config.NumberColumn("買入價(原幣)", min_value=0.0, step=0.01, format="%.2f"),
-        },
-        hide_index=True,
-        num_rows="dynamic",
-        width="stretch",
-        key="holdings_editor",
-    )
+    sidebar_tickers = tuple(st.session_state.holdings["ticker"].tolist())
+    sidebar_quotes = load_quotes(sidebar_tickers) if sidebar_tickers else {}
 
-    holdings = clean_holdings(edited)
+    st.sidebar.caption("數量填 0 代表只觀察。每張卡片可編輯、排序，並顯示即時行情。")
+
+    rows = []
+    pending_action = None
+    current_holdings = clean_holdings(st.session_state.holdings)
+    last_index = len(current_holdings) - 1
+    for index, row in enumerate(current_holdings.itertuples(index=False)):
+        with st.sidebar.container(border=True):
+            st.markdown(
+                """
+                <div class="sidebar-row-guide">
+                    <span>標的</span><span>數量</span><span>買入價</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            input_cols = st.columns([1.2, 0.8, 0.86], gap=None, vertical_alignment="center")
+            ticker = input_cols[0].text_input(
+                "標的",
+                value=str(row.ticker),
+                label_visibility="collapsed",
+                key=f"ticker_input_{index}",
+            )
+            quantity = input_cols[1].number_input(
+                "數量",
+                min_value=0.0,
+                value=float(row.quantity),
+                step=1.0,
+                format="%.0f",
+                label_visibility="collapsed",
+                key=f"quantity_input_{index}",
+            )
+            purchase_price = input_cols[2].number_input(
+                "買入價",
+                min_value=0.0,
+                value=float(row.purchase_price),
+                step=0.01,
+                format="%.2f",
+                label_visibility="collapsed",
+                key=f"purchase_input_{index}",
+            )
+
+            clean_ticker = ticker.strip().upper()
+            quote = sidebar_quotes.get(clean_ticker)
+            if clean_ticker and quote is None:
+                quote = load_quotes((clean_ticker,)).get(clean_ticker)
+
+            action_cols = st.columns([1, 0.09, 0.09, 0.14], gap=None, vertical_alignment="center")
+            action_cols[0].markdown(sidebar_market_summary_html(clean_ticker, quote), unsafe_allow_html=True)
+            if action_cols[1].button(
+                "↑",
+                key=f"move_up_holding_{index}",
+                help="上移",
+                disabled=index == 0,
+                type="tertiary",
+                width="content",
+            ):
+                pending_action = ("up", index)
+            if action_cols[2].button(
+                "↓",
+                key=f"move_down_holding_{index}",
+                help="下移",
+                disabled=index == last_index,
+                type="tertiary",
+                width="content",
+            ):
+                pending_action = ("down", index)
+            if action_cols[3].button(
+                "刪",
+                key=f"delete_holding_{index}",
+                help="刪除這個標的",
+                type="tertiary",
+                width="content",
+            ):
+                pending_action = ("delete", index)
+
+            rows.append(
+                {
+                    "order": index + 1,
+                    "ticker": clean_ticker,
+                    "quantity": quantity,
+                    "purchase_price": purchase_price,
+                }
+            )
+
+    if pending_action is not None:
+        action, target_index = pending_action
+        if action == "delete":
+            rows.pop(target_index)
+        elif action == "up" and target_index > 0:
+            rows[target_index - 1], rows[target_index] = rows[target_index], rows[target_index - 1]
+        elif action == "down" and target_index < len(rows) - 1:
+            rows[target_index + 1], rows[target_index] = rows[target_index], rows[target_index + 1]
+        for order, item in enumerate(rows, start=1):
+            item["order"] = order
+        st.session_state.holdings = clean_holdings(pd.DataFrame(rows))
+        st.rerun()
+
+    holdings = clean_holdings(pd.DataFrame(rows))
     st.session_state.holdings = holdings
+    quotes = load_quotes(tuple(holdings["ticker"].tolist())) if not holdings.empty else {}
+
+    add_cols = st.sidebar.columns([0.68, 0.32])
+    new_ticker = add_cols[0].text_input(
+        "新增標的",
+        value="",
+        placeholder="例如 AAPL",
+        label_visibility="collapsed",
+        key="new_ticker_input",
+    )
+    if add_cols[1].button("新增", width="stretch"):
+        candidate = new_ticker.strip().upper()
+        if candidate:
+            next_row = {
+                "order": len(holdings) + 1,
+                "ticker": candidate,
+                "quantity": 0.0,
+                "purchase_price": 0.0,
+            }
+            st.session_state.holdings = clean_holdings(pd.concat([holdings, pd.DataFrame([next_row])]))
+            st.rerun()
 
     if st.sidebar.button("儲存持倉", width="stretch"):
         save_holdings(holdings)
@@ -453,7 +679,7 @@ def render_sidebar() -> pd.DataFrame:
 
     st.sidebar.divider()
     st.sidebar.caption("價格資料來源：Yahoo Finance / yfinance。新聞來源：Yahoo奇摩股市。資料每次開啟頁面更新，並快取 5 分鐘。")
-    return holdings
+    return holdings, quotes
 
 
 def quote_currency(ticker: str, quote) -> str:
@@ -527,28 +753,6 @@ def render_holdings_summary(holdings: pd.DataFrame, quotes, fx_rate: float | Non
             }
         )
     return pd.DataFrame(rows).set_index("標的") if rows else pd.DataFrame()
-
-
-def render_ticker_cards(selected: list[str], quotes) -> None:
-    st.sidebar.subheader("即時價格")
-    for ticker in selected:
-        quote = quotes.get(ticker)
-        name = ticker_display_name(ticker, quote)
-        price = fmt_currency(quote.price, quote.currency) if quote else "N/A"
-        change = fmt_signed(quote.day_change) if quote else "N/A"
-        change_pct = fmt_percent(quote.day_change_pct) if quote else "N/A"
-        color = "#22c55e" if quote and quote.day_change and quote.day_change >= 0 else "#fb7185"
-        st.sidebar.markdown(
-            f"""
-            <div class="ticker-card">
-                <strong>{escape(ticker)}</strong><br>
-                <span>{escape(name)}</span><br>
-                <div style="margin-top:6px;">{escape(price)}</div>
-                <div style="color:{color}; font-size:0.86rem;">{escape(change)} ({escape(change_pct)})</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
 
 
 def render_position_metrics(holdings_summary: pd.DataFrame, fx_rate: float | None) -> None:
@@ -631,7 +835,7 @@ def render_news(news: list[dict[str, str]]) -> None:
 
 
 def main() -> None:
-    holdings = render_sidebar()
+    holdings, quotes = render_sidebar()
     selected = holdings["ticker"].tolist()
     if not selected:
         st.warning("請至少選擇一個追蹤標的。")
@@ -640,13 +844,12 @@ def main() -> None:
     with st.spinner("正在更新 Yahoo Finance 資料..."):
         tickers = tuple(selected)
         prices = load_history(tickers, period="20y")
-        quotes = load_quotes(tickers)
+        quotes = quotes or load_quotes(tickers)
         dividends = {ticker: load_dividends(ticker) for ticker in selected}
         fx_rate = load_fx_rate()
         news = load_news(tickers)
 
     weights = portfolio_weights(holdings, quotes, fx_rate)
-    render_ticker_cards(selected, quotes)
 
     st.title("投資儀表板")
     st.caption("即時價格與買入價保留原幣別；市值、成本、損益與配置比例統一換算為台幣。新聞取自 Yahoo奇摩股市，快取時間：5 分鐘。")
