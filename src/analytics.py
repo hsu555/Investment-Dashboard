@@ -75,9 +75,7 @@ def metrics_table(prices: pd.DataFrame) -> pd.DataFrame:
             {
                 "標的": ticker,
                 "Total Return": total_return(series),
-                "CAGR 1Y": cagr_values["1Y"],
-                "CAGR 3Y": cagr_values["3Y"],
-                "CAGR 5Y": cagr_values["5Y"],
+                **{f"CAGR {label}": cagr_values[label] for label in CAGR_WINDOWS},
                 "Max Drawdown": max_drawdown(series),
                 "Annualized Volatility": annualized_volatility(series),
             }

@@ -95,6 +95,20 @@ def save_holdings(holdings: pd.DataFrame) -> None:
     )
 
 
+def clear_sidebar_editor_state() -> None:
+    prefixes = (
+        "ticker_input_",
+        "quantity_input_",
+        "purchase_input_",
+        "move_up_holding_",
+        "move_down_holding_",
+        "delete_holding_",
+    )
+    for key in list(st.session_state.keys()):
+        if key.startswith(prefixes):
+            del st.session_state[key]
+
+
 st.set_page_config(
     page_title="投資儀表板",
     page_icon="📈",
@@ -316,7 +330,7 @@ def sidebar_market_summary_html(ticker: str, quote) -> str:
     if quote is None:
         return (
             '<div class="sidebar-action-line">'
-            '<span class="market muted">現價 N/A / 漲跌 N/A</span>'
+            '<span class="market muted">行情更新中...</span>'
             "</div>"
         )
 
@@ -543,21 +557,24 @@ def render_security_analysis(
             st.write(profile.summary)
 
 
-def render_sidebar() -> tuple[pd.DataFrame, dict]:
+def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
     st.sidebar.title("追蹤清單")
     if "holdings" not in st.session_state:
         st.session_state.holdings = load_holdings()
+    if "latest_quotes" not in st.session_state:
+        st.session_state.latest_quotes = {}
 
-    sidebar_tickers = tuple(st.session_state.holdings["ticker"].tolist())
-    sidebar_quotes = load_quotes(sidebar_tickers) if sidebar_tickers else {}
+    sidebar_quotes = st.session_state.latest_quotes
 
     st.sidebar.caption("數量填 0 代表只觀察。每張卡片可編輯、排序，並顯示即時行情。")
 
     rows = []
+    quote_slots = []
     pending_action = None
     current_holdings = clean_holdings(st.session_state.holdings)
     last_index = len(current_holdings) - 1
     for index, row in enumerate(current_holdings.itertuples(index=False)):
+        row_key = str(row.ticker)
         with st.sidebar.container(border=True):
             st.markdown(
                 """
@@ -572,7 +589,7 @@ def render_sidebar() -> tuple[pd.DataFrame, dict]:
                 "標的",
                 value=str(row.ticker),
                 label_visibility="collapsed",
-                key=f"ticker_input_{index}",
+                key=f"ticker_input_{row_key}",
             )
             quantity = input_cols[1].number_input(
                 "數量",
@@ -581,7 +598,7 @@ def render_sidebar() -> tuple[pd.DataFrame, dict]:
                 step=1.0,
                 format="%.0f",
                 label_visibility="collapsed",
-                key=f"quantity_input_{index}",
+                key=f"quantity_input_{row_key}",
             )
             purchase_price = input_cols[2].number_input(
                 "買入價",
@@ -590,16 +607,16 @@ def render_sidebar() -> tuple[pd.DataFrame, dict]:
                 step=0.01,
                 format="%.2f",
                 label_visibility="collapsed",
-                key=f"purchase_input_{index}",
+                key=f"purchase_input_{row_key}",
             )
 
             clean_ticker = ticker.strip().upper()
             quote = sidebar_quotes.get(clean_ticker)
-            if clean_ticker and quote is None:
-                quote = load_quotes((clean_ticker,)).get(clean_ticker)
 
             action_cols = st.columns([1, 0.09, 0.09, 0.14], gap=None, vertical_alignment="center")
-            action_cols[0].markdown(sidebar_market_summary_html(clean_ticker, quote), unsafe_allow_html=True)
+            quote_slot = action_cols[0].empty()
+            quote_slot.markdown(sidebar_market_summary_html(clean_ticker, quote), unsafe_allow_html=True)
+            quote_slots.append((clean_ticker, quote_slot))
             if action_cols[1].button(
                 "↑",
                 key=f"move_up_holding_{index}",
@@ -647,11 +664,16 @@ def render_sidebar() -> tuple[pd.DataFrame, dict]:
         for order, item in enumerate(rows, start=1):
             item["order"] = order
         st.session_state.holdings = clean_holdings(pd.DataFrame(rows))
+        clear_sidebar_editor_state()
         st.rerun()
 
     holdings = clean_holdings(pd.DataFrame(rows))
     st.session_state.holdings = holdings
-    quotes = load_quotes(tuple(holdings["ticker"].tolist())) if not holdings.empty else {}
+    quotes = {
+        ticker: sidebar_quotes[ticker]
+        for ticker in holdings["ticker"].tolist()
+        if ticker in sidebar_quotes
+    }
 
     add_cols = st.sidebar.columns([0.68, 0.32])
     new_ticker = add_cols[0].text_input(
@@ -671,6 +693,7 @@ def render_sidebar() -> tuple[pd.DataFrame, dict]:
                 "purchase_price": 0.0,
             }
             st.session_state.holdings = clean_holdings(pd.concat([holdings, pd.DataFrame([next_row])]))
+            clear_sidebar_editor_state()
             st.rerun()
 
     if st.sidebar.button("儲存持倉", width="stretch"):
@@ -679,7 +702,7 @@ def render_sidebar() -> tuple[pd.DataFrame, dict]:
 
     st.sidebar.divider()
     st.sidebar.caption("價格資料來源：Yahoo Finance / yfinance。新聞來源：Yahoo奇摩股市。資料每次開啟頁面更新，並快取 5 分鐘。")
-    return holdings, quotes
+    return holdings, quotes, quote_slots
 
 
 def quote_currency(ticker: str, quote) -> str:
@@ -779,6 +802,11 @@ def render_position_metrics(holdings_summary: pd.DataFrame, fx_rate: float | Non
     cols[4].metric("USD/TWD", fmt_currency(fx_rate, "TWD"))
 
 
+def update_sidebar_quote_slots(quote_slots: list[tuple[str, object]], quotes) -> None:
+    for ticker, slot in quote_slots:
+        slot.markdown(sidebar_market_summary_html(ticker, quotes.get(ticker)), unsafe_allow_html=True)
+
+
 def render_dividend_summary(selected: list[str], quotes, dividends: dict[str, pd.Series]) -> pd.DataFrame:
     rows = []
     for ticker in selected:
@@ -835,45 +863,40 @@ def render_news(news: list[dict[str, str]]) -> None:
 
 
 def main() -> None:
-    holdings, quotes = render_sidebar()
+    holdings, quotes, quote_slots = render_sidebar()
     selected = holdings["ticker"].tolist()
     if not selected:
         st.warning("請至少選擇一個追蹤標的。")
         return
 
-    with st.spinner("正在更新 Yahoo Finance 資料..."):
-        tickers = tuple(selected)
-        prices = load_history(tickers, period="20y")
-        quotes = quotes or load_quotes(tickers)
-        dividends = {ticker: load_dividends(ticker) for ticker in selected}
-        fx_rate = load_fx_rate()
-        news = load_news(tickers)
-
-    weights = portfolio_weights(holdings, quotes, fx_rate)
-
+    tickers = tuple(selected)
     st.title("投資儀表板")
     st.caption("即時價格與買入價保留原幣別；市值、成本、損益與配置比例統一換算為台幣。新聞取自 Yahoo奇摩股市，快取時間：5 分鐘。")
 
-    if prices.empty:
-        st.error("目前無法取得價格歷史資料，請稍後重新整理。")
-        return
+    load_status = st.status("正在準備投資儀表板...", expanded=True)
+    load_status.write("更新追蹤清單即時報價與日漲跌。")
+    quotes = load_quotes(tickers)
+    st.session_state.latest_quotes = quotes
+    update_sidebar_quote_slots(quote_slots, quotes)
+    load_status.write("取得 USD/TWD 匯率，換算台幣市值與損益。")
+    fx_rate = load_fx_rate()
+    load_status.update(label="核心資料已載入", state="complete", expanded=False)
 
-    metrics = metrics_table(prices)
-    growth = growth_curve(prices)
-    annual_dividends = yearly_dividends(dividends)
+    weights = portfolio_weights(holdings, quotes, fx_rate)
     holdings_summary = render_holdings_summary(holdings, quotes, fx_rate)
     held_tickers = holdings.loc[holdings["quantity"] > 0, "ticker"].tolist()
-    held_metrics = metrics.reindex(held_tickers).dropna(how="all") if held_tickers else pd.DataFrame()
     held_summary = holdings_summary.reindex(held_tickers).dropna(how="all") if held_tickers else pd.DataFrame()
-    observation_metrics = metrics
 
     render_position_metrics(held_summary, fx_rate)
 
-    tab_holdings, tab_observation, tab_security, tab_dividends, tab_news = st.tabs(
-        ["持有資產", "觀察指標", "個股分析", "配息資訊", "新聞摘要"]
+    active_view = st.radio(
+        "檢視",
+        ["持有資產", "觀察指標", "個股分析", "配息資訊", "新聞摘要"],
+        horizontal=True,
+        label_visibility="collapsed",
     )
 
-    with tab_holdings:
+    if active_view == "持有資產":
         if held_summary.empty:
             st.info("目前沒有數量大於 0 的持有標的。")
         else:
@@ -896,18 +919,16 @@ def main() -> None:
                 formatted_holdings[column] = formatted_holdings[column].map(fmt_percent)
             st.dataframe(formatted_holdings, width="stretch", height=320)
 
-        if held_metrics.empty:
-            st.info("目前沒有數量大於 0 的持有標的歷史指標。")
-        else:
-            st.subheader("持有標的歷史指標")
-            display_held_metrics = held_metrics.copy()
-            st.dataframe(
-                add_display_name_column(percent_dataframe(display_held_metrics), quotes),
-                width="stretch",
-                height=240,
-            )
+    elif active_view == "觀察指標":
+        with st.status("正在載入追蹤標的歷史價格...", expanded=True) as history_status:
+            history_status.write("讀取 20 年歷史價格，用於成長曲線、CAGR 與波動比較。")
+            prices = load_history(tickers, period="20y")
+            history_status.update(label="追蹤標的歷史價格已載入", state="complete", expanded=False)
+        if prices.empty:
+            st.error("目前無法取得價格歷史資料，請稍後重新整理。")
+            return
 
-    with tab_observation:
+        observation_metrics = metrics_table(prices)
         growth_window = st.radio(
             "成長曲線期間",
             options=["1年", "5年", "20年"],
@@ -931,10 +952,18 @@ def main() -> None:
             height=300,
         )
 
-    with tab_security:
+    elif active_view == "個股分析":
         render_security_analysis(selected, quotes, holdings_summary)
 
-    with tab_dividends:
+    elif active_view == "配息資訊":
+        with st.status("正在載入配息資料...", expanded=True) as dividend_status:
+            dividends = {}
+            for ticker in selected:
+                dividend_status.write(f"讀取 {ticker} 配息紀錄。")
+                dividends[ticker] = load_dividends(ticker)
+            annual_dividends = yearly_dividends(dividends)
+            dividend_status.update(label="配息資料已載入", state="complete", expanded=False)
+
         summary = render_dividend_summary(selected, quotes, dividends)
         formatted = summary.copy()
         formatted["Dividend Yield"] = formatted["Dividend Yield"].map(fmt_percent)
@@ -950,7 +979,11 @@ def main() -> None:
         else:
             st.plotly_chart(dividend_chart(annual_dividends), width="stretch")
 
-    with tab_news:
+    elif active_view == "新聞摘要":
+        with st.status("正在抓取 Yahoo奇摩股市新聞...", expanded=True) as news_status:
+            news_status.write("讀取 RSS 分類並比對追蹤標的關鍵字。")
+            news = load_news(tickers)
+            news_status.update(label="新聞資料已載入", state="complete", expanded=False)
         render_news(news)
 
 

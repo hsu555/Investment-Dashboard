@@ -7,6 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+from .config import CAGR_WINDOWS
+
 
 TEMPLATE = "plotly_dark"
 COLOR_SEQUENCE = [
@@ -100,7 +102,9 @@ def growth_chart(growth: pd.DataFrame, metrics: pd.DataFrame | None = None, titl
 
 
 def comparison_chart(metrics: pd.DataFrame) -> go.Figure:
-    display = metrics[["CAGR 1Y", "CAGR 3Y", "CAGR 5Y", "Annualized Volatility"]].copy()
+    metric_columns = [f"CAGR {label}" for label in CAGR_WINDOWS if f"CAGR {label}" in metrics]
+    metric_columns.append("Annualized Volatility")
+    display = metrics[metric_columns].copy()
     display = display.reset_index().melt(id_vars="標的", var_name="Metric", value_name="Value")
     fig = px.bar(
         display,
