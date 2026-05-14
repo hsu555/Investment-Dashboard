@@ -27,7 +27,7 @@
 - 美元 / 台幣匯率（Yahoo Finance `TWD=X`）
 - Yahoo奇摩股市繁體中文財經新聞摘要
 
-資料每次開啟頁面會更新，並以 Streamlit 快取 5 分鐘，避免頻繁打 API。新聞來源使用 Yahoo奇摩股市 RSS。
+資料每次開啟頁面會更新，並以 Streamlit 快取 30 分鐘，避免頻繁打 API。新聞來源使用 Yahoo奇摩股市 RSS。
 
 ## 安裝
 
