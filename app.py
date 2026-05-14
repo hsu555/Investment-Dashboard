@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from html import escape
 from pathlib import Path
+import time
 
 import pandas as pd
 import streamlit as st
@@ -22,7 +24,7 @@ from src.charts import (
     momentum_chart,
     technical_price_chart,
 )
-from src.config import DEFAULT_TICKERS
+from src.config import CACHE_TTL_SECONDS, DEFAULT_TICKERS
 from src.data import (
     load_dividends,
     load_fx_rate,
@@ -37,6 +39,11 @@ from src.names import ticker_display_name
 
 
 PORTFOLIO_FILE = Path(__file__).with_name("portfolio.json")
+
+
+@st.cache_resource
+def background_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=4)
 
 
 def parse_tickers(value: str) -> list[str]:
@@ -480,6 +487,7 @@ def render_security_analysis(
     selected: list[str],
     quotes,
     holdings_summary: pd.DataFrame,
+    prefetched_security: dict[str, object] | None = None,
 ) -> None:
     st.subheader("個股 / ETF 分析")
     choices = selected
@@ -489,11 +497,17 @@ def render_security_analysis(
     manual = cols[1].text_input("或輸入 Yahoo Finance 代號", value=picked, placeholder="例如 AAPL、SPY、2330.TW")
     ticker = manual.strip().upper() or picked
 
-    with st.spinner(f"正在載入 {ticker} 個股分析資料..."):
-        profile = load_security_profile(ticker)
-        quote_map = quotes if ticker in quotes else load_quotes((ticker,))
-        quote = quote_map.get(ticker)
-        daily_history = load_ohlcv_history(ticker, period="20y")
+    prefetched_ticker = str(prefetched_security.get("ticker")) if prefetched_security else None
+    if prefetched_security and ticker == prefetched_ticker:
+        profile = prefetched_security["profile"]
+        quote = quotes.get(ticker)
+        daily_history = prefetched_security["daily_history"]
+    else:
+        with st.spinner(f"正在載入 {ticker} 個股分析資料..."):
+            profile = load_security_profile(ticker)
+            quote_map = quotes if ticker in quotes else load_quotes((ticker,))
+            quote = quote_map.get(ticker)
+            daily_history = load_ohlcv_history(ticker, period="20y")
 
     if daily_history.empty:
         st.warning("目前無法取得這個標的的歷史價格，請確認代號是否符合 Yahoo Finance 格式。")
@@ -701,7 +715,7 @@ def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
         st.sidebar.success("已儲存，下次開啟會自動載入。")
 
     st.sidebar.divider()
-    st.sidebar.caption("價格資料來源：Yahoo Finance / yfinance。新聞來源：Yahoo奇摩股市。資料每次開啟頁面更新，並快取 5 分鐘。")
+    st.sidebar.caption("價格資料來源：Yahoo Finance / yfinance。新聞來源：Yahoo奇摩股市。資料每次開啟頁面更新，並快取 30 分鐘。")
     return holdings, quotes, quote_slots
 
 
@@ -862,6 +876,78 @@ def render_news(news: list[dict[str, str]]) -> None:
         )
 
 
+def build_observation_data(tickers: tuple[str, ...]) -> dict[str, object]:
+    prices = load_history(tickers, period="20y")
+    metrics = metrics_table(prices) if not prices.empty else pd.DataFrame()
+    return {"prices": prices, "metrics": metrics}
+
+
+def build_dividend_data(tickers: tuple[str, ...]) -> dict[str, object]:
+    dividends = {ticker: load_dividends(ticker) for ticker in tickers}
+    return {"dividends": dividends, "annual_dividends": yearly_dividends(dividends)}
+
+
+def build_security_data(ticker: str) -> dict[str, object]:
+    return {
+        "ticker": ticker,
+        "profile": load_security_profile(ticker),
+        "daily_history": load_ohlcv_history(ticker, period="20y"),
+    }
+
+
+def ensure_prefetch_jobs(tickers: tuple[str, ...]) -> dict[str, Future]:
+    cache_window = int(time.time() // CACHE_TTL_SECONDS)
+    prefetch_key = f"{cache_window}|{'|'.join(tickers)}"
+    if st.session_state.get("prefetch_key") != prefetch_key:
+        st.session_state.prefetch_key = prefetch_key
+        st.session_state.prefetch_jobs = {}
+
+    jobs = st.session_state.prefetch_jobs
+    if "observation" not in jobs:
+        jobs["observation"] = background_executor().submit(build_observation_data, tickers)
+    if "dividends" not in jobs:
+        jobs["dividends"] = background_executor().submit(build_dividend_data, tickers)
+    if "news" not in jobs:
+        jobs["news"] = background_executor().submit(load_news, tickers)
+    if tickers and "security" not in jobs:
+        jobs["security"] = background_executor().submit(build_security_data, tickers[0])
+    return jobs
+
+
+def wait_for_prefetch(jobs: dict[str, Future], name: str, label: str):
+    future = jobs.get(name)
+    if future is None:
+        return None
+    if future.done():
+        try:
+            return future.result()
+        except Exception:
+            return None
+
+    with st.status(f"{label}仍在背景載入...", expanded=True) as status:
+        status.write("首屏已先顯示，這裡接續等待同一個背景工作完成。")
+        try:
+            result = future.result()
+            status.update(label=f"{label}已載入", state="complete", expanded=False)
+            return result
+        except Exception:
+            status.update(label=f"{label}背景載入未完成，改由目前頁面載入", state="error", expanded=False)
+            return None
+
+
+def prefetch_status_caption(jobs: dict[str, Future]) -> str:
+    labels = {
+        "observation": "觀察指標",
+        "security": "個股分析",
+        "dividends": "配息資訊",
+        "news": "新聞摘要",
+    }
+    pending = [label for key, label in labels.items() if key in jobs and not jobs[key].done()]
+    if not pending:
+        return "其他檢視資料已在背景預載完成。"
+    return f"正在背景預載：{'、'.join(pending)}。你可以先查看持有資產。"
+
+
 def main() -> None:
     holdings, quotes, quote_slots = render_sidebar()
     selected = holdings["ticker"].tolist()
@@ -871,7 +957,7 @@ def main() -> None:
 
     tickers = tuple(selected)
     st.title("投資儀表板")
-    st.caption("即時價格與買入價保留原幣別；市值、成本、損益與配置比例統一換算為台幣。新聞取自 Yahoo奇摩股市，快取時間：5 分鐘。")
+    st.caption("即時價格與買入價保留原幣別；市值、成本、損益與配置比例統一換算為台幣。新聞取自 Yahoo奇摩股市，快取時間：30 分鐘。")
 
     load_status = st.status("正在準備投資儀表板...", expanded=True)
     load_status.write("更新追蹤清單即時報價與日漲跌。")
@@ -895,6 +981,7 @@ def main() -> None:
         horizontal=True,
         label_visibility="collapsed",
     )
+    prefetch_jobs = ensure_prefetch_jobs(tickers)
 
     if active_view == "持有資產":
         if held_summary.empty:
@@ -918,21 +1005,27 @@ def main() -> None:
             for column in ["未實現報酬率", "配置比例"]:
                 formatted_holdings[column] = formatted_holdings[column].map(fmt_percent)
             st.dataframe(formatted_holdings, width="stretch", height=320)
+        st.caption(prefetch_status_caption(prefetch_jobs))
 
     elif active_view == "觀察指標":
-        with st.status("正在載入追蹤標的歷史價格...", expanded=True) as history_status:
-            history_status.write("讀取 20 年歷史價格，用於成長曲線、CAGR 與波動比較。")
-            prices = load_history(tickers, period="20y")
-            history_status.update(label="追蹤標的歷史價格已載入", state="complete", expanded=False)
+        observation_data = wait_for_prefetch(prefetch_jobs, "observation", "觀察指標資料")
+        if observation_data is None:
+            with st.status("正在載入追蹤標的歷史價格...", expanded=True) as history_status:
+                history_status.write("讀取 20 年歷史價格，用於成長曲線、CAGR 與波動比較。")
+                prices = load_history(tickers, period="20y")
+                observation_metrics = metrics_table(prices) if not prices.empty else pd.DataFrame()
+                history_status.update(label="追蹤標的歷史價格已載入", state="complete", expanded=False)
+        else:
+            prices = observation_data["prices"]
+            observation_metrics = observation_data["metrics"]
         if prices.empty:
             st.error("目前無法取得價格歷史資料，請稍後重新整理。")
             return
 
-        observation_metrics = metrics_table(prices)
         growth_window = st.radio(
             "成長曲線期間",
             options=["1年", "5年", "20年"],
-            index=1,
+            index=0,
             horizontal=True,
         )
         growth_years = {"1年": 1, "5年": 5, "20年": 20}[growth_window]
@@ -953,16 +1046,22 @@ def main() -> None:
         )
 
     elif active_view == "個股分析":
-        render_security_analysis(selected, quotes, holdings_summary)
+        security_data = wait_for_prefetch(prefetch_jobs, "security", "個股分析資料")
+        render_security_analysis(selected, quotes, holdings_summary, security_data)
 
     elif active_view == "配息資訊":
-        with st.status("正在載入配息資料...", expanded=True) as dividend_status:
-            dividends = {}
-            for ticker in selected:
-                dividend_status.write(f"讀取 {ticker} 配息紀錄。")
-                dividends[ticker] = load_dividends(ticker)
-            annual_dividends = yearly_dividends(dividends)
-            dividend_status.update(label="配息資料已載入", state="complete", expanded=False)
+        dividend_data = wait_for_prefetch(prefetch_jobs, "dividends", "配息資料")
+        if dividend_data is None:
+            with st.status("正在載入配息資料...", expanded=True) as dividend_status:
+                dividends = {}
+                for ticker in selected:
+                    dividend_status.write(f"讀取 {ticker} 配息紀錄。")
+                    dividends[ticker] = load_dividends(ticker)
+                annual_dividends = yearly_dividends(dividends)
+                dividend_status.update(label="配息資料已載入", state="complete", expanded=False)
+        else:
+            dividends = dividend_data["dividends"]
+            annual_dividends = dividend_data["annual_dividends"]
 
         summary = render_dividend_summary(selected, quotes, dividends)
         formatted = summary.copy()
@@ -980,10 +1079,12 @@ def main() -> None:
             st.plotly_chart(dividend_chart(annual_dividends), width="stretch")
 
     elif active_view == "新聞摘要":
-        with st.status("正在抓取 Yahoo奇摩股市新聞...", expanded=True) as news_status:
-            news_status.write("讀取 RSS 分類並比對追蹤標的關鍵字。")
-            news = load_news(tickers)
-            news_status.update(label="新聞資料已載入", state="complete", expanded=False)
+        news = wait_for_prefetch(prefetch_jobs, "news", "新聞資料")
+        if news is None:
+            with st.status("正在抓取 Yahoo奇摩股市新聞...", expanded=True) as news_status:
+                news_status.write("讀取 RSS 分類並比對追蹤標的關鍵字。")
+                news = load_news(tickers)
+                news_status.update(label="新聞資料已載入", state="complete", expanded=False)
         render_news(news)
 
 
