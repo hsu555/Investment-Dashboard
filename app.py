@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
+import hmac
 import json
 from html import escape
 from pathlib import Path
@@ -8,6 +9,7 @@ import time
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 
 from src.analytics import (
     growth_curve,
@@ -39,6 +41,7 @@ from src.names import ticker_display_name
 
 
 PORTFOLIO_FILE = Path(__file__).with_name("portfolio.json")
+PASSWORD_SECRET_KEY = "dashboard_password"
 
 
 @st.cache_resource
@@ -114,6 +117,41 @@ def clear_sidebar_editor_state() -> None:
     for key in list(st.session_state.keys()):
         if key.startswith(prefixes):
             del st.session_state[key]
+
+
+def check_password() -> bool:
+    if st.session_state.get("password_authenticated", False):
+        return True
+
+    st.title("投資儀表板")
+    st.caption("請先輸入密碼，通過後才會載入持倉與投資資料。")
+
+    with st.form("login_form"):
+        password = st.text_input("密碼", type="password")
+        submitted = st.form_submit_button("登入", type="primary")
+
+    try:
+        configured_password = st.secrets.get(PASSWORD_SECRET_KEY, "")
+    except StreamlitSecretNotFoundError:
+        configured_password = ""
+    if submitted:
+        if not configured_password:
+            st.error(f"尚未設定登入密碼。請在 Streamlit Secrets 新增 `{PASSWORD_SECRET_KEY}`。")
+            return False
+        if hmac.compare_digest(password, str(configured_password)):
+            st.session_state.password_authenticated = True
+            st.session_state.login_failed = False
+            st.rerun()
+        st.session_state.login_failed = True
+
+    if st.session_state.get("login_failed", False):
+        st.error("密碼錯誤，無法存取儀表板。")
+    return False
+
+
+def require_password() -> None:
+    if not check_password():
+        st.stop()
 
 
 st.set_page_config(
@@ -573,6 +611,11 @@ def render_security_analysis(
 
 def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
     st.sidebar.title("追蹤清單")
+    if st.sidebar.button("登出", width="stretch"):
+        st.session_state.password_authenticated = False
+        st.session_state.login_failed = False
+        st.rerun()
+
     if "holdings" not in st.session_state:
         st.session_state.holdings = load_holdings()
     if "latest_quotes" not in st.session_state:
@@ -949,6 +992,8 @@ def prefetch_status_caption(jobs: dict[str, Future]) -> str:
 
 
 def main() -> None:
+    require_password()
+
     holdings, quotes, quote_slots = render_sidebar()
     selected = holdings["ticker"].tolist()
     if not selected:

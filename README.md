@@ -45,6 +45,18 @@ streamlit run app.py
 
 開啟瀏覽器中的本機網址後即可使用。
 
+## 登入密碼
+
+儀表板啟動後會先要求輸入密碼，通過後才會載入持倉與投資資料。密碼從 Streamlit Secrets 的 `dashboard_password` 讀取，不要寫在程式碼裡。
+
+本機開發時可建立 `.streamlit/secrets.toml`：
+
+```toml
+dashboard_password = "你的強密碼"
+```
+
+`.streamlit/secrets.toml` 已在 `.gitignore` 中，不會提交到 GitHub。部署到 Streamlit Community Cloud 時，請到 app settings 的 Secrets 貼上同樣內容。
+
 ## 專案結構
 
 ```text
