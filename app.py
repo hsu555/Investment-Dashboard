@@ -26,7 +26,7 @@ from src.charts import (
     momentum_chart,
     technical_price_chart,
 )
-from src.config import CACHE_TTL_SECONDS, DEFAULT_TICKERS
+from src.config import CACHE_TTL_NEWS, CACHE_TTL_QUOTES, DEFAULT_TICKERS
 from src.data import (
     load_dividends,
     load_fx_rate,
@@ -42,11 +42,19 @@ from src.names import ticker_display_name
 
 PORTFOLIO_FILE = Path(__file__).with_name("portfolio.json")
 PASSWORD_SECRET_KEY = "dashboard_password"
+_MAX_FAILED_ATTEMPTS = 5
+_LOCKOUT_SECONDS = 300  # 5分鐘鎖定
 
 
 @st.cache_resource
 def background_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=4)
+
+
+@st.cache_resource
+def _auth_store() -> dict:
+    """Server-side 鎖定狀態，跨 session / 重新整理均有效。"""
+    return {"lockout_until": 0.0, "failed_attempts": 0}
 
 
 def parse_tickers(value: str) -> list[str]:
@@ -126,6 +134,13 @@ def check_password() -> bool:
     st.title("投資儀表板")
     st.caption("請先輸入密碼，通過後才會載入持倉與投資資料。")
 
+    # 鎖定檢查：使用 server-side store，重新整理無法繞過
+    store = _auth_store()
+    if store["lockout_until"] > time.time():
+        remaining = int(store["lockout_until"] - time.time())
+        st.error(f"登入嘗試次數過多，請等待 {remaining} 秒後再試。")
+        return False
+
     with st.form("login_form"):
         password = st.text_input("密碼", type="password")
         submitted = st.form_submit_button("登入", type="primary")
@@ -134,18 +149,27 @@ def check_password() -> bool:
         configured_password = st.secrets.get(PASSWORD_SECRET_KEY, "")
     except StreamlitSecretNotFoundError:
         configured_password = ""
+
     if submitted:
         if not configured_password:
             st.error(f"尚未設定登入密碼。請在 Streamlit Secrets 新增 `{PASSWORD_SECRET_KEY}`。")
             return False
         if hmac.compare_digest(password, str(configured_password)):
             st.session_state.password_authenticated = True
-            st.session_state.login_failed = False
+            store["failed_attempts"] = 0
             st.rerun()
+
+        # 登入失敗：累計 server-side 次數
+        store["failed_attempts"] += 1
         st.session_state.login_failed = True
+        if store["failed_attempts"] >= _MAX_FAILED_ATTEMPTS:
+            store["lockout_until"] = time.time() + _LOCKOUT_SECONDS
+            store["failed_attempts"] = 0
+            st.rerun()
 
     if st.session_state.get("login_failed", False):
-        st.error("密碼錯誤，無法存取儀表板。")
+        remaining_attempts = _MAX_FAILED_ATTEMPTS - store["failed_attempts"]
+        st.error(f"密碼錯誤，無法存取儀表板。（還剩 {remaining_attempts} 次機會）")
     return False
 
 
@@ -939,7 +963,7 @@ def build_security_data(ticker: str) -> dict[str, object]:
 
 
 def ensure_prefetch_jobs(tickers: tuple[str, ...]) -> dict[str, Future]:
-    cache_window = int(time.time() // CACHE_TTL_SECONDS)
+    cache_window = int(time.time() // CACHE_TTL_NEWS)
     prefetch_key = f"{cache_window}|{'|'.join(tickers)}"
     if st.session_state.get("prefetch_key") != prefetch_key:
         st.session_state.prefetch_key = prefetch_key

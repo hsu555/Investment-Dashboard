@@ -14,8 +14,16 @@ import requests
 import streamlit as st
 import yfinance as yf
 import yfinance.cache as yf_cache
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from .config import CACHE_TTL_SECONDS, FX_TICKER, YAHOO_TW_RSS_FEEDS
+from .config import (
+    CACHE_TTL_HISTORY,
+    CACHE_TTL_NEWS,
+    CACHE_TTL_PROFILE,
+    CACHE_TTL_QUOTES,
+    FX_TICKER,
+    YAHOO_TW_RSS_FEEDS,
+)
 
 YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
 YAHOO_HEADERS = {
@@ -29,6 +37,24 @@ try:
     yf_cache.set_cache_location(str(YFINANCE_CACHE_DIR))
 except Exception:
     pass
+
+# 網路錯誤重試：最多 3 次，指數退避 2→4→8 秒
+_NETWORK_RETRY = retry(
+    retry=retry_if_exception_type((
+        requests.exceptions.ConnectionError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ChunkedEncodingError,
+    )),
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=8),
+    reraise=True,
+)
+
+
+@_NETWORK_RETRY
+def _http_get(url: str, **kwargs) -> requests.Response:
+    """requests.get 加重試，由呼叫端處理 raise_for_status 及例外。"""
+    return requests.get(url, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -102,26 +128,35 @@ def _quiet_yfinance(callable_object):
         return callable_object()
 
 
-def _fast_info_snapshot(ticker: str) -> dict[str, object]:
-    keys = [
-        "currency",
-        "last_price",
-        "previous_close",
-        "regular_market_previous_close",
-        "market_cap",
-        "year_low",
-        "year_high",
-        "three_month_average_volume",
-        "ten_day_average_volume",
-        "exchange",
-        "quote_type",
-    ]
+_FAST_INFO_KEYS = [
+    "currency",
+    "last_price",
+    "previous_close",
+    "regular_market_previous_close",
+    "market_cap",
+    "year_low",
+    "year_high",
+    "three_month_average_volume",
+    "ten_day_average_volume",
+    "exchange",
+    "quote_type",
+]
 
+
+@_NETWORK_RETRY
+def _fetch_fast_info(ticker: str) -> dict[str, object]:
+    """yf.Ticker fast_info fetch with network retry (reraises on exhaustion)."""
     def load() -> dict[str, object]:
         info = yf.Ticker(ticker).fast_info
-        return {key: _fast_info_value(info, key) for key in keys}
-
+        return {key: _fast_info_value(info, key) for key in _FAST_INFO_KEYS}
     return _quiet_yfinance(load)
+
+
+def _fast_info_snapshot(ticker: str) -> dict[str, object]:
+    try:
+        return _fetch_fast_info(ticker)
+    except Exception:
+        return {}
 
 
 def _as_text(value: object) -> str | None:
@@ -142,7 +177,7 @@ def _info_value(info: dict[str, object], *keys: str) -> object:
 def _quote_search_result(ticker: str) -> dict[str, object]:
     """Fetch search metadata without using Yahoo endpoints that require crumb auth."""
     try:
-        response = requests.get(
+        response = _http_get(
             YAHOO_SEARCH_URL,
             params={"q": ticker, "quotesCount": 6, "newsCount": 0},
             timeout=8,
@@ -186,7 +221,7 @@ def _clean_html(value: str) -> str:
     return " ".join(text.split())
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_HISTORY, show_spinner=False)
 def load_history(tickers: tuple[str, ...], period: str = "5y") -> pd.DataFrame:
     """Load adjusted close history for all tracked tickers."""
     if not tickers:
@@ -223,7 +258,7 @@ def load_history(tickers: tuple[str, ...], period: str = "5y") -> pd.DataFrame:
     return prices
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_HISTORY, show_spinner=False)
 def load_ohlcv_history(ticker: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
     """Load OHLCV history for one ticker."""
     try:
@@ -253,7 +288,7 @@ def load_ohlcv_history(ticker: str, period: str = "5y", interval: str = "1d") ->
     return history.sort_index().dropna(how="all")
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_HISTORY, show_spinner=False)
 def load_dividends(ticker: str) -> pd.Series:
     """Load dividend series for one ticker."""
     try:
@@ -268,7 +303,7 @@ def load_dividends(ticker: str) -> pd.Series:
     return dividends.sort_index()
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_QUOTES, show_spinner=False)
 def load_quotes(tickers: tuple[str, ...]) -> dict[str, Quote]:
     """Load current quote metadata for tickers."""
     quotes: dict[str, Quote] = {}
@@ -306,7 +341,7 @@ def load_quotes(tickers: tuple[str, ...]) -> dict[str, Quote]:
     return quotes
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_PROFILE, show_spinner=False)
 def load_security_profile(ticker: str) -> SecurityProfile:
     """Load quote summary and fundamental fields for one stock or ETF."""
     search = _quote_search_result(ticker)
@@ -363,7 +398,7 @@ def load_security_profile(ticker: str) -> SecurityProfile:
     )
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_QUOTES, show_spinner=False)
 def load_fx_rate() -> float | None:
     """Load USD/TWD exchange rate using Yahoo Finance TWD=X."""
     try:
@@ -397,7 +432,7 @@ def load_fx_rate() -> float | None:
     return _as_float(close.iloc[-1])
 
 
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL_NEWS, show_spinner=False)
 def load_news(tickers: tuple[str, ...], limit: int = 8) -> list[dict[str, str]]:
     """Load Traditional Chinese Yahoo Taiwan Finance RSS news."""
     items: list[dict[str, str]] = []
@@ -407,7 +442,7 @@ def load_news(tickers: tuple[str, ...], limit: int = 8) -> list[dict[str, str]]:
     for category, url in YAHOO_TW_RSS_FEEDS.items():
         category_count = 0
         try:
-            response = requests.get(
+            response = _http_get(
                 url,
                 timeout=10,
                 headers=YAHOO_HEADERS,
