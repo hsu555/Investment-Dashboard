@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 DEFAULT_TICKERS = [
+    "0050.TW",
+    "NVDA",
+    "QQQ",
     "VT",
     "VOO",
-    "VXUS",
-    "QQQ",
-    "BND",
-    "0050.TW",
-    "0056.TW",
+]
+
+DEFAULT_HOLDINGS = [
+    {"ticker": "0050.TW", "quantity": 102000.0, "purchase_price": 58.5},
+    {"ticker": "NVDA", "quantity": 500.0, "purchase_price": 188.0},
+    {"ticker": "QQQ", "quantity": 0.0, "purchase_price": 0.0},
+    {"ticker": "VOO", "quantity": 0.0, "purchase_price": 0.0},
+    {"ticker": "VT", "quantity": 0.0, "purchase_price": 0.0},
 ]
 
 TICKER_DISPLAY_NAMES = {
@@ -19,7 +25,6 @@ TICKER_DISPLAY_NAMES = {
     "QQQ": "Invesco QQQ Trust",
     "BND": "Vanguard Total Bond Market",
     "0050.TW": "元大台灣卓越50",
-    "0056.TW": "元大高股息",
 }
 
 CAGR_WINDOWS = {

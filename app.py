@@ -26,7 +26,7 @@ from src.charts import (
     momentum_chart,
     technical_price_chart,
 )
-from src.config import CACHE_TTL_NEWS, CACHE_TTL_QUOTES, DEFAULT_TICKERS
+from src.config import CACHE_TTL_NEWS, CACHE_TTL_QUOTES, DEFAULT_HOLDINGS, DEFAULT_TICKERS
 from src.data import (
     clear_timing_log,
     load_dividends,
@@ -66,13 +66,27 @@ def parse_tickers(value: str) -> list[str]:
 
 
 def default_holdings() -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "order": range(1, len(DEFAULT_TICKERS) + 1),
-            "ticker": DEFAULT_TICKERS,
-            "quantity": [0.0] * len(DEFAULT_TICKERS),
-            "purchase_price": [0.0] * len(DEFAULT_TICKERS),
-        }
+    if DEFAULT_HOLDINGS:
+        records = [
+            {
+                "order": index,
+                "ticker": holding["ticker"],
+                "quantity": holding.get("quantity", 0.0),
+                "purchase_price": holding.get("purchase_price", 0.0),
+            }
+            for index, holding in enumerate(DEFAULT_HOLDINGS, start=1)
+        ]
+        return clean_holdings(pd.DataFrame(records))
+
+    return clean_holdings(
+        pd.DataFrame(
+            {
+                "order": range(1, len(DEFAULT_TICKERS) + 1),
+                "ticker": DEFAULT_TICKERS,
+                "quantity": [0.0] * len(DEFAULT_TICKERS),
+                "purchase_price": [0.0] * len(DEFAULT_TICKERS),
+            }
+        )
     )
 
 
