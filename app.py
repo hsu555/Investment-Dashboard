@@ -28,6 +28,7 @@ from src.charts import (
 )
 from src.config import CACHE_TTL_NEWS, CACHE_TTL_QUOTES, DEFAULT_TICKERS
 from src.data import (
+    clear_timing_log,
     load_dividends,
     load_fx_rate,
     load_history,
@@ -35,6 +36,7 @@ from src.data import (
     load_ohlcv_history,
     load_quotes,
     load_security_profile,
+    read_timing_log,
 )
 from src.formatting import fmt_currency, fmt_percent, fmt_signed
 from src.names import ticker_display_name
@@ -783,6 +785,14 @@ def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
 
     st.sidebar.divider()
     st.sidebar.caption("價格資料來源：Yahoo Finance / yfinance。新聞來源：Yahoo奇摩股市。資料每次開啟頁面更新，並快取 30 分鐘。")
+
+    with st.sidebar.expander("API 計時紀錄", expanded=False):
+        log = read_timing_log()
+        if log.strip():
+            st.code(log, language=None)
+        else:
+            st.caption("尚無紀錄（快取命中時不會重新呼叫 API）")
+
     return holdings, quotes, quote_slots
 
 
@@ -876,9 +886,9 @@ def render_position_metrics(holdings_summary: pd.DataFrame, fx_rate: float | Non
         total_return = total_gain / total_cost if total_gain is not None and total_cost else None
 
     cols = st.columns(5)
-    cols[0].metric("持有市值(TWD)", fmt_currency(float(total_market_value), "TWD") if total_market_value else "N/A")
-    cols[1].metric("投入成本(TWD)", fmt_currency(float(total_cost), "TWD") if total_cost else "N/A")
-    cols[2].metric("未實現損益(TWD)", fmt_currency(float(total_gain), "TWD") if total_gain is not None else "N/A")
+    cols[0].metric("持有市值(TWD)", fmt_currency(float(total_market_value)) if total_market_value else "N/A")
+    cols[1].metric("投入成本(TWD)", fmt_currency(float(total_cost)) if total_cost else "N/A")
+    cols[2].metric("未實現損益(TWD)", fmt_currency(float(total_gain)) if total_gain is not None else "N/A")
     cols[3].metric("未實現報酬率", fmt_percent(float(total_return)) if total_return is not None else "N/A")
     cols[4].metric("USD/TWD", fmt_currency(fx_rate, "TWD"))
 
@@ -950,7 +960,9 @@ def build_observation_data(tickers: tuple[str, ...]) -> dict[str, object]:
 
 
 def build_dividend_data(tickers: tuple[str, ...]) -> dict[str, object]:
-    dividends = {ticker: load_dividends(ticker) for ticker in tickers}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = {ticker: executor.submit(load_dividends, ticker) for ticker in tickers}
+        dividends = {ticker: fut.result() for ticker, fut in futures.items()}
     return {"dividends": dividends, "annual_dividends": yearly_dividends(dividends)}
 
 
@@ -1016,6 +1028,10 @@ def prefetch_status_caption(jobs: dict[str, Future]) -> str:
 
 
 def main() -> None:
+    if "timing_log_cleared" not in st.session_state:
+        clear_timing_log()
+        st.session_state.timing_log_cleared = True
+
     require_password()
 
     holdings, quotes, quote_slots = render_sidebar()
@@ -1122,10 +1138,10 @@ def main() -> None:
         dividend_data = wait_for_prefetch(prefetch_jobs, "dividends", "配息資料")
         if dividend_data is None:
             with st.status("正在載入配息資料...", expanded=True) as dividend_status:
-                dividends = {}
-                for ticker in selected:
-                    dividend_status.write(f"讀取 {ticker} 配息紀錄。")
-                    dividends[ticker] = load_dividends(ticker)
+                dividend_status.write(f"平行讀取 {len(selected)} 支標的配息紀錄。")
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = {ticker: executor.submit(load_dividends, ticker) for ticker in selected}
+                    dividends = {ticker: fut.result() for ticker, fut in futures.items()}
                 annual_dividends = yearly_dividends(dividends)
                 dividend_status.update(label="配息資料已載入", state="complete", expanded=False)
         else:

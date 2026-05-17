@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import re
 import contextlib
+import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import io
 from pathlib import Path
+import time
 import xml.etree.ElementTree as ET
 
 import pandas as pd
@@ -37,6 +40,47 @@ try:
     yf_cache.set_cache_location(str(YFINANCE_CACHE_DIR))
 except Exception:
     pass
+
+TIMING_LOG = Path(__file__).resolve().parents[1] / "timing.log"
+
+
+def clear_timing_log() -> None:
+    """Call once at app startup to start a fresh session log."""
+    try:
+        TIMING_LOG.write_text(
+            f"=== session {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n",
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def read_timing_log() -> str:
+    try:
+        return TIMING_LOG.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+@contextlib.contextmanager
+def _timed(label: str):
+    """Context manager that appends one timing line to timing.log."""
+    t0 = time.perf_counter()
+    meta: dict[str, object] = {}
+    try:
+        yield meta
+    finally:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        size_str = str(meta.get("size", ""))
+        line = f"  {datetime.datetime.now().strftime('%H:%M:%S')}  {label:<45}  {elapsed_ms:7.0f} ms"
+        if size_str:
+            line += f"  [{size_str}]"
+        line += "\n"
+        try:
+            with TIMING_LOG.open("a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
 
 # 網路錯誤重試：最多 3 次，指數退避 2→4→8 秒
 _NETWORK_RETRY = retry(
@@ -146,10 +190,13 @@ _FAST_INFO_KEYS = [
 @_NETWORK_RETRY
 def _fetch_fast_info(ticker: str) -> dict[str, object]:
     """yf.Ticker fast_info fetch with network retry (reraises on exhaustion)."""
-    def load() -> dict[str, object]:
-        info = yf.Ticker(ticker).fast_info
-        return {key: _fast_info_value(info, key) for key in _FAST_INFO_KEYS}
-    return _quiet_yfinance(load)
+    with _timed(f"fast_info  {ticker}") as meta:
+        def load() -> dict[str, object]:
+            info = yf.Ticker(ticker).fast_info
+            return {key: _fast_info_value(info, key) for key in _FAST_INFO_KEYS}
+        result = _quiet_yfinance(load)
+        meta["size"] = f"{sum(1 for v in result.values() if v is not None)}/{len(_FAST_INFO_KEYS)} fields"
+    return result
 
 
 def _fast_info_snapshot(ticker: str) -> dict[str, object]:
@@ -176,17 +223,20 @@ def _info_value(info: dict[str, object], *keys: str) -> object:
 
 def _quote_search_result(ticker: str) -> dict[str, object]:
     """Fetch search metadata without using Yahoo endpoints that require crumb auth."""
-    try:
-        response = _http_get(
-            YAHOO_SEARCH_URL,
-            params={"q": ticker, "quotesCount": 6, "newsCount": 0},
-            timeout=8,
-            headers=YAHOO_HEADERS,
-        )
-        response.raise_for_status()
-        quotes = response.json().get("quotes", [])
-    except Exception:
-        return {}
+    with _timed(f"search     {ticker}") as meta:
+        try:
+            response = _http_get(
+                YAHOO_SEARCH_URL,
+                params={"q": ticker, "quotesCount": 6, "newsCount": 0},
+                timeout=8,
+                headers=YAHOO_HEADERS,
+            )
+            response.raise_for_status()
+            quotes = response.json().get("quotes", [])
+            meta["size"] = f"{len(response.content)} bytes"
+        except Exception:
+            meta["size"] = "error"
+            return {}
 
     if not isinstance(quotes, list):
         return {}
@@ -227,18 +277,21 @@ def load_history(tickers: tuple[str, ...], period: str = "5y") -> pd.DataFrame:
     if not tickers:
         return pd.DataFrame()
 
-    try:
-        raw = yf.download(
-            list(tickers),
-            period=period,
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="column",
-            threads=True,
-        )
-    except Exception:
-        return pd.DataFrame()
+    with _timed(f"yf.download history {period} ×{len(tickers)}") as meta:
+        try:
+            raw = yf.download(
+                list(tickers),
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="column",
+                threads=True,
+            )
+            meta["size"] = f"{raw.shape[0]} rows × {raw.shape[1]} cols" if not raw.empty else "empty"
+        except Exception:
+            meta["size"] = "error"
+            return pd.DataFrame()
 
     if raw.empty:
         return pd.DataFrame()
@@ -261,17 +314,20 @@ def load_history(tickers: tuple[str, ...], period: str = "5y") -> pd.DataFrame:
 @st.cache_data(ttl=CACHE_TTL_HISTORY, show_spinner=False)
 def load_ohlcv_history(ticker: str, period: str = "5y", interval: str = "1d") -> pd.DataFrame:
     """Load OHLCV history for one ticker."""
-    try:
-        raw = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=True,
-            progress=False,
-            threads=False,
-        )
-    except Exception:
-        return pd.DataFrame()
+    with _timed(f"yf.download ohlcv {ticker} {period}/{interval}") as meta:
+        try:
+            raw = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            meta["size"] = f"{raw.shape[0]} rows" if not raw.empty else "empty"
+        except Exception:
+            meta["size"] = "error"
+            return pd.DataFrame()
 
     if raw.empty:
         return pd.DataFrame()
@@ -291,10 +347,13 @@ def load_ohlcv_history(ticker: str, period: str = "5y", interval: str = "1d") ->
 @st.cache_data(ttl=CACHE_TTL_HISTORY, show_spinner=False)
 def load_dividends(ticker: str) -> pd.Series:
     """Load dividend series for one ticker."""
-    try:
-        dividends = yf.Ticker(ticker).dividends
-    except Exception:
-        return pd.Series(dtype=float)
+    with _timed(f"dividends  {ticker}") as meta:
+        try:
+            dividends = yf.Ticker(ticker).dividends
+            meta["size"] = f"{len(dividends)} records" if dividends is not None else "none"
+        except Exception:
+            meta["size"] = "error"
+            return pd.Series(dtype=float)
 
     if dividends is None or dividends.empty:
         return pd.Series(dtype=float)
@@ -303,36 +362,86 @@ def load_dividends(ticker: str) -> pd.Series:
     return dividends.sort_index()
 
 
+def _currency_from_ticker(ticker: str) -> str:
+    """Derive currency from ticker suffix — avoids a per-ticker fast_info call."""
+    suffix_map = {
+        ".TW": "TWD", ".TWO": "TWD",
+        ".HK": "HKD",
+        ".L": "GBP",
+        ".DE": "EUR", ".PA": "EUR", ".AS": "EUR", ".MI": "EUR",
+        ".T": "JPY",
+    }
+    for suffix, currency in suffix_map.items():
+        if ticker.upper().endswith(suffix.upper()):
+            return currency
+    return "USD"
+
+
 @st.cache_data(ttl=CACHE_TTL_QUOTES, show_spinner=False)
 def load_quotes(tickers: tuple[str, ...]) -> dict[str, Quote]:
-    """Load current quote metadata for tickers."""
+    """Load current quote metadata using one batch yf.download + parallel name searches."""
+    # One batch request for all tickers' closing prices
+    prices_last: dict[str, float | None] = {t: None for t in tickers}
+    prices_prev: dict[str, float | None] = {t: None for t in tickers}
+    with _timed(f"yf.download quotes 5d ×{len(tickers)}") as meta:
+        try:
+            raw = yf.download(
+                list(tickers),
+                period="5d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                group_by="column",
+                threads=True,
+            )
+            meta["size"] = f"{raw.shape[0]} rows × {raw.shape[1]} cols" if not raw.empty else "empty"
+        except Exception:
+            meta["size"] = "error"
+            raw = pd.DataFrame()
+
+    if not raw.empty:
+        if isinstance(raw.columns, pd.MultiIndex):
+            close = raw["Close"].copy() if "Close" in raw.columns.get_level_values(0) else pd.DataFrame()
+        elif "Close" in raw.columns:
+            close = raw[["Close"]].rename(columns={"Close": tickers[0]})
+        else:
+            close = pd.DataFrame()
+
+        if not close.empty:
+            close = close.sort_index().dropna(how="all")
+            for ticker in tickers:
+                col = ticker if ticker in close.columns else (close.columns[0] if len(close.columns) == 1 else None)
+                if col is not None:
+                    valid = close[col].dropna()
+                    if len(valid) >= 1:
+                        prices_last[ticker] = _as_float(valid.iloc[-1])
+                    if len(valid) >= 2:
+                        prices_prev[ticker] = _as_float(valid.iloc[-2])
+
+    # Fetch display names for all tickers in parallel
+    with ThreadPoolExecutor(max_workers=min(len(tickers), 8)) as executor:
+        name_futures = {ticker: executor.submit(_quote_name_from_search, ticker) for ticker in tickers}
+        names = {ticker: fut.result() for ticker, fut in name_futures.items()}
+
     quotes: dict[str, Quote] = {}
     for ticker in tickers:
-        try:
-            info = _fast_info_snapshot(ticker)
-        except Exception:
-            info = {}
-
-        price = _as_float(_fast_info_value(info, "last_price"))
-        previous_close = _as_float(
-            _fast_info_value(info, "previous_close")
-            or _fast_info_value(info, "regular_market_previous_close")
-        )
+        last_price = prices_last[ticker]
+        previous_close = prices_prev[ticker]
+        long_name, short_name = names.get(ticker, (None, None))
 
         day_change = None
         day_change_pct = None
-        if price is not None and previous_close not in (None, 0):
-            day_change = price - previous_close
+        if last_price is not None and previous_close not in (None, 0):
+            day_change = last_price - previous_close
             day_change_pct = day_change / previous_close
 
-        long_name, short_name = _quote_name_from_search(ticker)
         quotes[ticker] = Quote(
             ticker=ticker,
-            price=price,
+            price=last_price,
             previous_close=previous_close,
             day_change=day_change,
             day_change_pct=day_change_pct,
-            currency=str(_fast_info_value(info, "currency") or ""),
+            currency=_currency_from_ticker(ticker),
             long_name=long_name,
             short_name=short_name,
             dividend_yield=None,
@@ -401,16 +510,19 @@ def load_security_profile(ticker: str) -> SecurityProfile:
 @st.cache_data(ttl=CACHE_TTL_QUOTES, show_spinner=False)
 def load_fx_rate() -> float | None:
     """Load USD/TWD exchange rate using Yahoo Finance TWD=X."""
-    try:
-        history = yf.download(
-            FX_TICKER,
-            period="5d",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-        )
-    except Exception:
-        return None
+    with _timed("yf.download fx TWD=X 5d") as meta:
+        try:
+            history = yf.download(
+                FX_TICKER,
+                period="5d",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+            )
+            meta["size"] = f"{len(history)} rows" if not history.empty else "empty"
+        except Exception:
+            meta["size"] = "error"
+            return None
 
     if history.empty:
         return None
@@ -441,16 +553,19 @@ def load_news(tickers: tuple[str, ...], limit: int = 8) -> list[dict[str, str]]:
 
     for category, url in YAHOO_TW_RSS_FEEDS.items():
         category_count = 0
-        try:
-            response = _http_get(
-                url,
-                timeout=10,
-                headers=YAHOO_HEADERS,
-            )
-            response.raise_for_status()
-            root = ET.fromstring(response.content)
-        except Exception:
-            continue
+        with _timed(f"rss        {category}") as meta:
+            try:
+                response = _http_get(
+                    url,
+                    timeout=10,
+                    headers=YAHOO_HEADERS,
+                )
+                response.raise_for_status()
+                root = ET.fromstring(response.content)
+                meta["size"] = f"{len(response.content)} bytes"
+            except Exception:
+                meta["size"] = "error"
+                continue
 
         for item in root.findall(".//item"):
             title = _clean_html(item.findtext("title", default="").strip())
