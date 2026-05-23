@@ -14,11 +14,21 @@ def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
     if st.sidebar.button("登出", width="stretch"):
         st.session_state.password_authenticated = False
         st.session_state.login_failed = False
+        st.session_state.pop("current_user", None)
+        st.session_state.pop("holdings", None)
+        st.session_state.pop("retirement_inputs", None)
+        st.session_state.pop("retirement_result", None)
         clear_auth_token()
         st.rerun()
 
+    current_user = st.session_state.get("current_user", {})
+    user_id = current_user.get("id")
+    username = current_user.get("username", "")
+    if username:
+        st.sidebar.caption(f"已登入：{username}")
+
     if "holdings" not in st.session_state:
-        st.session_state.holdings = load_holdings()
+        st.session_state.holdings = load_holdings(user_id, username)
     if "latest_quotes" not in st.session_state:
         st.session_state.latest_quotes = {}
 
@@ -155,7 +165,7 @@ def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
             st.rerun()
 
     if st.sidebar.button("儲存持倉", width="stretch"):
-        save_holdings(holdings)
+        save_holdings(holdings, user_id)
         st.sidebar.success("已儲存，下次開啟會自動載入。")
 
     st.sidebar.divider()
@@ -169,5 +179,3 @@ def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
             st.caption("尚無紀錄（快取命中時不會重新呼叫 API）")
 
     return holdings, quotes, quote_slots
-
-

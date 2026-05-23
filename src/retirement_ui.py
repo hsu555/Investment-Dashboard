@@ -5,47 +5,97 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.retirement import MonteCarloResult, RetirementInputs, run_monte_carlo
+from src.supabase_store import (
+    SupabaseConfigError,
+    SupabaseRequestError,
+    load_retirement_settings,
+    save_retirement_settings,
+    supabase_configured,
+)
 
 
 def _fmt_wan(value: float, digits: int = 0) -> str:
     return f"{value:,.{digits}f} 萬"
 
 
-def _render_inputs(current_assets_wan: float) -> RetirementInputs:
+def _default_inputs(current_assets_wan: float) -> RetirementInputs:
+    return RetirementInputs(
+        current_age=49,
+        retirement_age=55,
+        life_expectancy=90,
+        current_assets_wan=float(current_assets_wan),
+        monthly_contribution_wan=2.0,
+        monthly_expense_wan=5.0,
+        mean_annual_return=0.07,
+        annual_return_std=0.15,
+        inflation_rate=0.03,
+        n_simulations=1000,
+    )
+
+
+def _inputs_from_settings(settings: dict | None, current_assets_wan: float) -> RetirementInputs:
+    defaults = _default_inputs(current_assets_wan)
+    if not settings:
+        return defaults
+    return RetirementInputs(
+        current_age=int(settings.get("current_age") or defaults.current_age),
+        retirement_age=int(settings.get("retirement_age") or defaults.retirement_age),
+        life_expectancy=int(settings.get("life_expectancy") or defaults.life_expectancy),
+        current_assets_wan=float(settings.get("current_assets_wan") or defaults.current_assets_wan),
+        monthly_contribution_wan=float(settings.get("monthly_contribution_wan") or defaults.monthly_contribution_wan),
+        monthly_expense_wan=float(settings.get("monthly_expense_wan") or defaults.monthly_expense_wan),
+        mean_annual_return=float(settings.get("mean_annual_return") or defaults.mean_annual_return),
+        annual_return_std=float(settings.get("annual_return_std") or defaults.annual_return_std),
+        inflation_rate=float(settings.get("inflation_rate") or defaults.inflation_rate),
+        n_simulations=int(settings.get("n_simulations") or defaults.n_simulations),
+    )
+
+
+def _load_saved_inputs(user_id: str | None, current_assets_wan: float) -> RetirementInputs:
+    if user_id and supabase_configured():
+        try:
+            return _inputs_from_settings(load_retirement_settings(user_id), current_assets_wan)
+        except (SupabaseConfigError, SupabaseRequestError) as exc:
+            st.error(f"無法從 Supabase 載入退休試算參數：{exc}")
+            st.stop()
+    return _default_inputs(current_assets_wan)
+
+
+def _render_inputs(defaults: RetirementInputs) -> RetirementInputs:
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown("**個人設定**")
-        current_age = int(st.number_input("目前年齡", min_value=18, max_value=80, value=49, step=1))
-        retirement_age = int(st.number_input("預計退休年齡", min_value=current_age + 1, max_value=90, value=55, step=1))
-        life_expectancy = int(st.number_input("預計試算年齡", min_value=retirement_age + 1, max_value=120, value=90, step=1))
+        current_age = int(st.number_input("目前年齡", min_value=18, max_value=80, value=defaults.current_age, step=1))
+        retirement_age = int(st.number_input("預計退休年齡", min_value=current_age + 1, max_value=90, value=max(defaults.retirement_age, current_age + 1), step=1))
+        life_expectancy = int(st.number_input("預計試算年齡", min_value=retirement_age + 1, max_value=120, value=max(defaults.life_expectancy, retirement_age + 1), step=1))
 
     with col2:
         st.markdown("**財務現況（萬元）**")
-        assets = st.number_input("現有投資資產（萬元）", min_value=0.0, value=float(current_assets_wan), step=10.0)
-        monthly_contribution = st.number_input("每月定期投入（萬元）", min_value=0.0, value=2.0, step=0.5)
+        assets = st.number_input("現有投資資產（萬元）", min_value=0.0, value=float(defaults.current_assets_wan), step=10.0)
+        monthly_contribution = st.number_input("每月定期投入（萬元）", min_value=0.0, value=defaults.monthly_contribution_wan, step=0.5)
 
     with col3:
         st.markdown("**退休後需求（萬元）**")
-        monthly_expense = st.number_input("退休後每月支出（萬元）", min_value=0.0, value=5.0, step=0.5)
+        monthly_expense = st.number_input("退休後每月支出（萬元）", min_value=0.0, value=defaults.monthly_expense_wan, step=0.5)
 
     st.markdown("**模擬參數**")
     pcol1, pcol2, pcol3, pcol4 = st.columns(4)
     with pcol1:
         mean_return = st.number_input(
-            "年化報酬率(%)", min_value=0.0, max_value=30.0, value=7.0, step=0.5, format="%.1f"
+            "年化報酬率(%)", min_value=0.0, max_value=30.0, value=defaults.mean_annual_return * 100, step=0.5, format="%.1f"
         )
     with pcol2:
         return_std = st.number_input(
-            "報酬率波動幅度 (%)", min_value=1.0, max_value=50.0, value=15.0, step=1.0, format="%.1f",
+            "報酬率波動幅度 (%)", min_value=1.0, max_value=50.0, value=defaults.annual_return_std * 100, step=1.0, format="%.1f",
             help="報酬率的標準差（Std Dev）。數值越大代表好年份漲更多、壞年份跌更深。全球股市歷史約 15–20%，債券約 5–8%。",
         )
     with pcol3:
         inflation = st.number_input(
-            "通膨率 (%)", min_value=0.0, max_value=10.0, value=3.0, step=0.5, format="%.1f"
+            "通膨率 (%)", min_value=0.0, max_value=10.0, value=defaults.inflation_rate * 100, step=0.5, format="%.1f"
         )
     with pcol4:
-        n_sim = int(st.number_input("模擬次數", min_value=100, max_value=5000, value=1000, step=100))
+        n_sim = int(st.number_input("模擬次數", min_value=100, max_value=5000, value=defaults.n_simulations, step=100))
 
     return RetirementInputs(
         current_age=current_age,
@@ -294,16 +344,23 @@ def render_retirement_view(total_market_value_twd: float | None) -> None:
     )
 
     current_assets_wan = round((total_market_value_twd or 0) / 10000)
+    current_user = st.session_state.get("current_user", {})
+    user_id = current_user.get("id")
+    if "retirement_inputs" not in st.session_state:
+        st.session_state.retirement_inputs = _load_saved_inputs(user_id, current_assets_wan)
 
     with st.expander("試算參數設定", expanded=True):
         with st.form("retirement_form"):
-            inputs = _render_inputs(current_assets_wan)
+            inputs = _render_inputs(st.session_state.retirement_inputs)
             submitted = st.form_submit_button("開始試算", type="primary", use_container_width=True)
 
     if submitted:
         st.session_state.retirement_inputs = inputs
-    elif "retirement_inputs" not in st.session_state:
-        st.session_state.retirement_inputs = inputs
+        if user_id and supabase_configured():
+            try:
+                save_retirement_settings(user_id, inputs)
+            except (SupabaseConfigError, SupabaseRequestError) as exc:
+                st.warning(f"試算完成，但退休參數未能存入 Supabase：{exc}")
 
     display_inputs = st.session_state.retirement_inputs
 

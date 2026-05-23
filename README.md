@@ -45,17 +45,24 @@ streamlit run app.py
 
 開啟瀏覽器中的本機網址後即可使用。
 
-## 登入密碼
+## Supabase 與登入
 
-儀表板啟動後會先要求輸入密碼，通過後才會載入持倉與投資資料。密碼從 Streamlit Secrets 的 `dashboard_password` 讀取，不要寫在程式碼裡。
+儀表板啟動後會先要求輸入帳號與密碼，通過後才會載入該使用者的持倉、觀察清單與退休試算參數。
+
+先到 Supabase SQL Editor 執行 `supabase_schema.sql` 建立資料表。接著在 Streamlit Secrets 設定：
 
 本機開發時可建立 `.streamlit/secrets.toml`：
 
 ```toml
-dashboard_password = "你的強密碼"
+supabase_url = "https://你的專案.supabase.co"
+supabase_service_role_key = "你的 service_role key"
+dashboard_password = "原本的儀表板密碼"
+default_username = "hsu555"
 ```
 
-`.streamlit/secrets.toml` 已在 `.gitignore` 中，不會提交到 GitHub。部署到 Streamlit Community Cloud 時，請到 app settings 的 Secrets 貼上同樣內容。
+第一次連上 Supabase 時，系統會自動建立預設使用者 `hsu555`，密碼使用 `dashboard_password`，並把現有 `portfolio.json` 的持股與觀察清單匯入這個帳號。後續新增使用者可在登入畫面的「新增使用者」建立。
+
+`.streamlit/secrets.toml` 已在 `.gitignore` 中，不會提交到 GitHub。部署到 Streamlit Community Cloud 時，請到 app settings 的 Secrets 貼上同樣內容。請使用 Supabase Project Settings > API 的 `service_role` key，不需要提供 Supabase 帳號密碼，也不需要直接提供 Postgres 密碼。
 
 ## 專案結構
 
@@ -87,7 +94,7 @@ dashboard_password = "你的強密碼"
 
 ### 儲存持倉
 
-側欄的「儲存持倉」會將標的、數量與買入價寫入 `portfolio.json`，下次開啟儀表板時自動載入。買入價請輸入該標的原幣別價格；例如美股輸入美元價格，台股輸入台幣價格。
+側欄的「儲存持倉」會將標的、數量與買入價寫入目前登入使用者的 Supabase 資料。未設定 Supabase 時，開發環境仍會暫時寫入 `portfolio.json`。買入價請輸入該標的原幣別價格；例如美股輸入美元價格，台股輸入台幣價格。
 
 ### 新增策略回測
 

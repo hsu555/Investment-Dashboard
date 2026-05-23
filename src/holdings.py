@@ -7,6 +7,15 @@ import pandas as pd
 import streamlit as st
 
 from src.config import DEFAULT_HOLDINGS, DEFAULT_TICKERS
+from src.supabase_store import (
+    SupabaseConfigError,
+    SupabaseRequestError,
+    default_username,
+    load_user_holdings,
+    save_user_holdings,
+    seed_user_holdings,
+    supabase_configured,
+)
 
 
 PORTFOLIO_FILE = Path(__file__).resolve().parents[1] / "portfolio.json"
@@ -57,7 +66,17 @@ def clean_holdings(frame: pd.DataFrame) -> pd.DataFrame:
     return cleaned[["order", "ticker", "quantity", "purchase_price"]]
 
 
-def load_holdings() -> pd.DataFrame:
+def load_holdings(user_id: str | None = None, username: str | None = None) -> pd.DataFrame:
+    if user_id and supabase_configured():
+        try:
+            if username == default_username():
+                seed_user_holdings(user_id)
+            loaded = clean_holdings(load_user_holdings(user_id))
+            return loaded if not loaded.empty else default_holdings()
+        except (SupabaseConfigError, SupabaseRequestError, OSError, ValueError) as exc:
+            st.error(f"無法從 Supabase 載入持倉資料：{exc}")
+            st.stop()
+
     try:
         payload = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -68,8 +87,12 @@ def load_holdings() -> pd.DataFrame:
     return clean_holdings(pd.DataFrame(payload))
 
 
-def save_holdings(holdings: pd.DataFrame) -> None:
+def save_holdings(holdings: pd.DataFrame, user_id: str | None = None) -> None:
     records = clean_holdings(holdings).to_dict(orient="records")
+    if user_id and supabase_configured():
+        save_user_holdings(user_id, pd.DataFrame(records))
+        return
+
     PORTFOLIO_FILE.write_text(
         json.dumps(records, ensure_ascii=False, indent=2),
         encoding="utf-8",
