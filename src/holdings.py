@@ -46,6 +46,20 @@ def default_holdings() -> pd.DataFrame:
     )
 
 
+def default_watchlist() -> pd.DataFrame:
+    tickers = [holding["ticker"] for holding in DEFAULT_HOLDINGS] if DEFAULT_HOLDINGS else DEFAULT_TICKERS
+    return clean_holdings(
+        pd.DataFrame(
+            {
+                "order": range(1, len(tickers) + 1),
+                "ticker": tickers,
+                "quantity": [0.0] * len(tickers),
+                "purchase_price": [0.0] * len(tickers),
+            }
+        )
+    )
+
+
 def clean_holdings(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=["order", "ticker", "quantity", "purchase_price"])
@@ -72,7 +86,7 @@ def load_holdings(user_id: str | None = None, username: str | None = None) -> pd
             if username == default_username():
                 seed_user_holdings(user_id)
             loaded = clean_holdings(load_user_holdings(user_id))
-            return loaded if not loaded.empty else default_holdings()
+            return loaded if not loaded.empty else default_watchlist()
         except (SupabaseConfigError, SupabaseRequestError, OSError, ValueError) as exc:
             st.error(f"無法從 Supabase 載入持倉資料：{exc}")
             st.stop()
