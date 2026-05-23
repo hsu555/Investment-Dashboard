@@ -61,41 +61,69 @@ def _load_saved_inputs(user_id: str | None, current_assets_wan: float) -> Retire
     return _default_inputs(current_assets_wan)
 
 
+def _ensure_retirement_form_state(defaults: RetirementInputs) -> None:
+    initial_values = {
+        "retirement_current_age": defaults.current_age,
+        "retirement_retirement_age": defaults.retirement_age,
+        "retirement_life_expectancy": defaults.life_expectancy,
+        "retirement_current_assets_wan": defaults.current_assets_wan,
+        "retirement_monthly_contribution_wan": defaults.monthly_contribution_wan,
+        "retirement_monthly_expense_wan": defaults.monthly_expense_wan,
+        "retirement_mean_return_pct": defaults.mean_annual_return * 100,
+        "retirement_return_std_pct": defaults.annual_return_std * 100,
+        "retirement_inflation_pct": defaults.inflation_rate * 100,
+        "retirement_n_simulations": defaults.n_simulations,
+    }
+    for key, value in initial_values.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _validate_inputs(inputs: RetirementInputs) -> str | None:
+    if inputs.retirement_age <= inputs.current_age:
+        return "預計退休年齡必須大於目前年齡。"
+    if inputs.life_expectancy <= inputs.retirement_age:
+        return "預計試算年齡必須大於預計退休年齡。"
+    return None
+
+
 def _render_inputs(defaults: RetirementInputs) -> RetirementInputs:
+    _ensure_retirement_form_state(defaults)
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown("**個人設定**")
-        current_age = int(st.number_input("目前年齡", min_value=18, max_value=80, value=defaults.current_age, step=1))
-        retirement_age = int(st.number_input("預計退休年齡", min_value=current_age + 1, max_value=90, value=max(defaults.retirement_age, current_age + 1), step=1))
-        life_expectancy = int(st.number_input("預計試算年齡", min_value=retirement_age + 1, max_value=120, value=max(defaults.life_expectancy, retirement_age + 1), step=1))
+        current_age = int(st.number_input("目前年齡", min_value=18, max_value=80, step=1, key="retirement_current_age"))
+        retirement_age = int(st.number_input("預計退休年齡", min_value=19, max_value=90, step=1, key="retirement_retirement_age"))
+        life_expectancy = int(st.number_input("預計試算年齡", min_value=20, max_value=120, step=1, key="retirement_life_expectancy"))
 
     with col2:
         st.markdown("**財務現況（萬元）**")
-        assets = st.number_input("現有投資資產（萬元）", min_value=0.0, value=float(defaults.current_assets_wan), step=10.0)
-        monthly_contribution = st.number_input("每月定期投入（萬元）", min_value=0.0, value=defaults.monthly_contribution_wan, step=0.5)
+        assets = st.number_input("現有投資資產（萬元）", min_value=0.0, step=10.0, key="retirement_current_assets_wan")
+        monthly_contribution = st.number_input("每月定期投入（萬元）", min_value=0.0, step=0.5, key="retirement_monthly_contribution_wan")
 
     with col3:
         st.markdown("**退休後需求（萬元）**")
-        monthly_expense = st.number_input("退休後每月支出（萬元）", min_value=0.0, value=defaults.monthly_expense_wan, step=0.5)
+        monthly_expense = st.number_input("退休後每月支出（萬元）", min_value=0.0, step=0.5, key="retirement_monthly_expense_wan")
 
     st.markdown("**模擬參數**")
     pcol1, pcol2, pcol3, pcol4 = st.columns(4)
     with pcol1:
         mean_return = st.number_input(
-            "年化報酬率(%)", min_value=0.0, max_value=30.0, value=defaults.mean_annual_return * 100, step=0.5, format="%.1f"
+            "年化報酬率(%)", min_value=0.0, max_value=30.0, step=0.5, format="%.1f", key="retirement_mean_return_pct"
         )
     with pcol2:
         return_std = st.number_input(
-            "報酬率波動幅度 (%)", min_value=1.0, max_value=50.0, value=defaults.annual_return_std * 100, step=1.0, format="%.1f",
+            "報酬率波動幅度 (%)", min_value=1.0, max_value=50.0, step=1.0, format="%.1f",
             help="報酬率的標準差（Std Dev）。數值越大代表好年份漲更多、壞年份跌更深。全球股市歷史約 15–20%，債券約 5–8%。",
+            key="retirement_return_std_pct",
         )
     with pcol3:
         inflation = st.number_input(
-            "通膨率 (%)", min_value=0.0, max_value=10.0, value=defaults.inflation_rate * 100, step=0.5, format="%.1f"
+            "通膨率 (%)", min_value=0.0, max_value=10.0, step=0.5, format="%.1f", key="retirement_inflation_pct"
         )
     with pcol4:
-        n_sim = int(st.number_input("模擬次數", min_value=100, max_value=5000, value=defaults.n_simulations, step=100))
+        n_sim = int(st.number_input("模擬次數", min_value=100, max_value=5000, step=100, key="retirement_n_simulations"))
 
     return RetirementInputs(
         current_age=current_age,
@@ -355,6 +383,10 @@ def render_retirement_view(total_market_value_twd: float | None) -> None:
             submitted = st.form_submit_button("開始試算", type="primary", use_container_width=True)
 
     if submitted:
+        validation_error = _validate_inputs(inputs)
+        if validation_error:
+            st.error(validation_error)
+            return
         st.session_state.retirement_inputs = inputs
         if user_id and supabase_configured():
             try:

@@ -18,6 +18,9 @@ def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
         st.session_state.pop("holdings", None)
         st.session_state.pop("retirement_inputs", None)
         st.session_state.pop("retirement_result", None)
+        for key in list(st.session_state.keys()):
+            if key.startswith("retirement_"):
+                del st.session_state[key]
         clear_auth_token()
         st.rerun()
 
