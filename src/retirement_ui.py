@@ -20,11 +20,11 @@ def _fmt_wan(value: float, digits: int = 0) -> str:
 
 def _default_inputs(current_assets_wan: float) -> RetirementInputs:
     return RetirementInputs(
-        current_age=49,
-        retirement_age=55,
+        current_age=30,
+        retirement_age=60,
         life_expectancy=90,
         current_assets_wan=float(current_assets_wan),
-        monthly_contribution_wan=2.0,
+        monthly_contribution_wan=1.0,
         monthly_expense_wan=5.0,
         mean_annual_return=0.07,
         annual_return_std=0.15,
