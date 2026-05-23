@@ -1,15 +1,10 @@
 from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
-import hmac
-import json
-from html import escape
-from pathlib import Path
 import time
 
 import pandas as pd
 import streamlit as st
-from streamlit.errors import StreamlitSecretNotFoundError
 
 from src.analytics import (
     growth_curve,
@@ -26,7 +21,8 @@ from src.charts import (
     momentum_chart,
     technical_price_chart,
 )
-from src.config import CACHE_TTL_NEWS, CACHE_TTL_QUOTES, DEFAULT_HOLDINGS, DEFAULT_TICKERS
+from src.auth import require_password
+from src.config import CACHE_TTL_NEWS
 from src.data import (
     clear_timing_log,
     load_dividends,
@@ -36,16 +32,26 @@ from src.data import (
     load_ohlcv_history,
     load_quotes,
     load_security_profile,
-    read_timing_log,
 )
 from src.formatting import fmt_currency, fmt_percent, fmt_signed
 from src.names import ticker_display_name
-
-
-PORTFOLIO_FILE = Path(__file__).with_name("portfolio.json")
-PASSWORD_SECRET_KEY = "dashboard_password"
-_MAX_FAILED_ATTEMPTS = 5
-_LOCKOUT_SECONDS = 300  # 5分鐘鎖定
+from src.portfolio import (
+    portfolio_weights,
+    render_dividend_summary,
+    render_holdings_summary,
+    render_position_metrics,
+)
+from src.retirement_ui import render_retirement_view
+from src.sidebar import render_sidebar
+from src.ui import (
+    add_display_name_column,
+    configure_page,
+    fmt_compact,
+    fmt_number,
+    percent_dataframe,
+    sidebar_market_summary_html,
+    value_or_fallback,
+)
 
 
 @st.cache_resource
@@ -53,383 +59,7 @@ def background_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=4)
 
 
-@st.cache_resource
-def _auth_store() -> dict:
-    """Server-side 鎖定狀態，跨 session / 重新整理均有效。"""
-    return {"lockout_until": 0.0, "failed_attempts": 0}
-
-
-def parse_tickers(value: str) -> list[str]:
-    separators = str.maketrans({",": " ", "，": " ", "\n": " "})
-    tickers = [ticker.strip().upper() for ticker in value.translate(separators).split()]
-    return list(dict.fromkeys(ticker for ticker in tickers if ticker))
-
-
-def default_holdings() -> pd.DataFrame:
-    if DEFAULT_HOLDINGS:
-        records = [
-            {
-                "order": index,
-                "ticker": holding["ticker"],
-                "quantity": holding.get("quantity", 0.0),
-                "purchase_price": holding.get("purchase_price", 0.0),
-            }
-            for index, holding in enumerate(DEFAULT_HOLDINGS, start=1)
-        ]
-        return clean_holdings(pd.DataFrame(records))
-
-    return clean_holdings(
-        pd.DataFrame(
-            {
-                "order": range(1, len(DEFAULT_TICKERS) + 1),
-                "ticker": DEFAULT_TICKERS,
-                "quantity": [0.0] * len(DEFAULT_TICKERS),
-                "purchase_price": [0.0] * len(DEFAULT_TICKERS),
-            }
-        )
-    )
-
-
-def clean_holdings(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty:
-        return pd.DataFrame(columns=["order", "ticker", "quantity", "purchase_price"])
-
-    cleaned = frame.copy()
-    for column in ["order", "ticker", "quantity", "purchase_price"]:
-        if column not in cleaned:
-            cleaned[column] = "" if column == "ticker" else None
-
-    cleaned["ticker"] = cleaned["ticker"].fillna("").astype(str).map(lambda value: value.strip().upper())
-    cleaned = cleaned[cleaned["ticker"] != ""]
-    cleaned["order"] = pd.to_numeric(cleaned["order"], errors="coerce")
-    cleaned["quantity"] = pd.to_numeric(cleaned["quantity"], errors="coerce").fillna(0.0).clip(lower=0)
-    cleaned["purchase_price"] = pd.to_numeric(cleaned["purchase_price"], errors="coerce").fillna(0.0).clip(lower=0)
-    cleaned = cleaned.drop_duplicates(subset="ticker", keep="last")
-    cleaned = cleaned.sort_values(["order", "ticker"], na_position="last").reset_index(drop=True)
-    cleaned["order"] = range(1, len(cleaned) + 1)
-    return cleaned[["order", "ticker", "quantity", "purchase_price"]]
-
-
-def load_holdings() -> pd.DataFrame:
-    try:
-        payload = json.loads(PORTFOLIO_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default_holdings()
-
-    if not isinstance(payload, list):
-        return default_holdings()
-    return clean_holdings(pd.DataFrame(payload))
-
-
-def save_holdings(holdings: pd.DataFrame) -> None:
-    records = clean_holdings(holdings).to_dict(orient="records")
-    PORTFOLIO_FILE.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def clear_sidebar_editor_state() -> None:
-    prefixes = (
-        "ticker_input_",
-        "quantity_input_",
-        "purchase_input_",
-        "move_up_holding_",
-        "move_down_holding_",
-        "delete_holding_",
-    )
-    for key in list(st.session_state.keys()):
-        if key.startswith(prefixes):
-            del st.session_state[key]
-
-
-def check_password() -> bool:
-    if st.session_state.get("password_authenticated", False):
-        return True
-
-    st.title("投資儀表板")
-    st.caption("請先輸入密碼，通過後才會載入持倉與投資資料。")
-
-    # 鎖定檢查：使用 server-side store，重新整理無法繞過
-    store = _auth_store()
-    if store["lockout_until"] > time.time():
-        remaining = int(store["lockout_until"] - time.time())
-        st.error(f"登入嘗試次數過多，請等待 {remaining} 秒後再試。")
-        return False
-
-    with st.form("login_form"):
-        password = st.text_input("密碼", type="password")
-        submitted = st.form_submit_button("登入", type="primary")
-
-    try:
-        configured_password = st.secrets.get(PASSWORD_SECRET_KEY, "")
-    except StreamlitSecretNotFoundError:
-        configured_password = ""
-
-    if submitted:
-        if not configured_password:
-            st.error(f"尚未設定登入密碼。請在 Streamlit Secrets 新增 `{PASSWORD_SECRET_KEY}`。")
-            return False
-        if hmac.compare_digest(password, str(configured_password)):
-            st.session_state.password_authenticated = True
-            store["failed_attempts"] = 0
-            st.rerun()
-
-        # 登入失敗：累計 server-side 次數
-        store["failed_attempts"] += 1
-        st.session_state.login_failed = True
-        if store["failed_attempts"] >= _MAX_FAILED_ATTEMPTS:
-            store["lockout_until"] = time.time() + _LOCKOUT_SECONDS
-            store["failed_attempts"] = 0
-            st.rerun()
-
-    if st.session_state.get("login_failed", False):
-        remaining_attempts = _MAX_FAILED_ATTEMPTS - store["failed_attempts"]
-        st.error(f"密碼錯誤，無法存取儀表板。（還剩 {remaining_attempts} 次機會）")
-    return False
-
-
-def require_password() -> None:
-    if not check_password():
-        st.stop()
-
-
-st.set_page_config(
-    page_title="投資儀表板",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown(
-    """
-    <style>
-    :root {
-        color-scheme: dark;
-    }
-    .stApp {
-        background: #0b1020;
-        color: #e5e7eb;
-    }
-    section[data-testid="stSidebar"] {
-        background: #111827;
-        border-right: 1px solid rgba(148, 163, 184, 0.18);
-    }
-    section[data-testid="stSidebar"] > div {
-        padding-top: 0.45rem;
-    }
-    div[data-testid="stSidebarUserContent"] {
-        padding-top: 0.2rem !important;
-    }
-    div[data-testid="stSidebarHeader"] {
-        height: 0 !important;
-        min-height: 0 !important;
-        padding: 0 !important;
-    }
-    div[data-testid="stSidebarHeader"] button {
-        position: absolute;
-        right: 0.4rem;
-        top: 0.35rem;
-        z-index: 2;
-    }
-    section[data-testid="stSidebar"] h1 {
-        margin-top: 0;
-        margin-bottom: 0.35rem;
-    }
-    div[data-testid="stMetric"] {
-        background: #111827;
-        border: 1px solid rgba(148, 163, 184, 0.16);
-        border-radius: 8px;
-        padding: 14px 16px;
-    }
-    div[data-testid="stMetricValue"] {
-        font-size: 1.55rem;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] {
-        background: rgba(17, 24, 39, 0.48);
-    }
-    section[data-testid="stSidebar"] div[data-testid="stVerticalBlockBorderWrapper"] > div {
-        padding: 5px 8px 6px;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"] {
-        gap: 0.42rem;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] {
-        flex-wrap: nowrap !important;
-        gap: 0 !important;
-    }
-    section[data-testid="stSidebar"] div[data-testid="column"] {
-        flex-shrink: 1 !important;
-        min-width: 0 !important;
-        overflow: hidden;
-        padding: 0 3px !important;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stTextInput"],
-    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] {
-        min-width: 0;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stTextInput"] input,
-    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] input {
-        line-height: 1.2;
-        min-height: 34px;
-        padding: 2px 6px;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stTextInput"] input {
-        font-size: 0.95rem;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] input {
-        font-size: 0.9rem;
-    }
-    section[data-testid="stSidebar"] div[data-baseweb="input"] {
-        min-height: 34px;
-    }
-    section[data-testid="stSidebar"] div[data-baseweb="input"] > div {
-        min-height: 34px;
-    }
-    section[data-testid="stSidebar"] div[data-testid="stNumberInput"] button {
-        display: none;
-    }
-    section[data-testid="stSidebar"] button[kind="secondary"] {
-        min-height: 34px;
-        padding: 2px 8px;
-    }
-    section[data-testid="stSidebar"] button[kind="tertiary"] {
-        font-size: 0.78rem;
-        min-height: 28px;
-        min-width: 20px;
-        padding: 0 1px;
-        white-space: nowrap;
-    }
-    .sidebar-row-guide {
-        color: #94a3b8;
-        display: grid;
-        font-size: 0.76rem;
-        gap: 0;
-        grid-template-columns: 1.2fr 0.8fr 0.86fr;
-        margin: 0 0 4px;
-    }
-    .sidebar-action-line {
-        align-items: center;
-        color: #cbd5e1;
-        display: flex;
-        font-size: 0.78rem;
-        gap: 8px;
-        line-height: 1.25;
-        margin-top: 0;
-        min-width: 0;
-    }
-    .sidebar-action-line .market {
-        flex: 1 1 auto;
-        font-size: 0.92rem;
-        font-weight: 700;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-    }
-    .sidebar-action-line .positive {
-        color: #22c55e;
-    }
-    .sidebar-action-line .negative {
-        color: #fb7185;
-    }
-    .sidebar-action-line .muted {
-        color: #94a3b8;
-    }
-    .block-container {
-        padding-top: 1.4rem;
-        padding-bottom: 2rem;
-        max-width: 1560px;
-    }
-    .news-item {
-        border-bottom: 1px solid rgba(148, 163, 184, 0.16);
-        padding: 12px 0;
-    }
-    .news-item a {
-        color: #93c5fd;
-        text-decoration: none;
-        font-weight: 650;
-    }
-    .news-meta {
-        color: #94a3b8;
-        font-size: 0.82rem;
-        margin-top: 3px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-
-def percent_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    return df.map(lambda value: fmt_percent(value) if pd.notna(value) else "N/A")
-
-
-def fmt_number(value: float | None, digits: int = 2) -> str:
-    if value is None or pd.isna(value):
-        return "N/A"
-    return f"{float(value):,.{digits}f}"
-
-
-def fmt_compact(value: float | None, currency: str | None = None) -> str:
-    if value is None or pd.isna(value):
-        return "N/A"
-    amount = float(value)
-    abs_amount = abs(amount)
-    units = [
-        (1_000_000_000_000, "T"),
-        (1_000_000_000, "B"),
-        (1_000_000, "M"),
-        (1_000, "K"),
-    ]
-    prefix = f"{currency} " if currency else ""
-    for divisor, suffix in units:
-        if abs_amount >= divisor:
-            return f"{prefix}{amount / divisor:,.2f}{suffix}"
-    return f"{prefix}{amount:,.2f}"
-
-
-def value_or_fallback(*values):
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, float) and pd.isna(value):
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        return value
-    return None
-
-
-def add_display_name_column(df: pd.DataFrame, quotes) -> pd.DataFrame:
-    display = df.copy()
-    display.insert(
-        0,
-        "名稱",
-        [ticker_display_name(str(ticker), quotes.get(str(ticker))) for ticker in display.index],
-    )
-    return display
-
-
-def sidebar_market_summary_html(ticker: str, quote) -> str:
-    if quote is None:
-        return (
-            '<div class="sidebar-action-line">'
-            '<span class="market muted">行情更新中...</span>'
-            "</div>"
-        )
-
-    currency = quote_currency(ticker, quote)
-    price = fmt_currency(quote.price, currency)
-    change = fmt_signed(quote.day_change)
-    change_pct = fmt_percent(quote.day_change_pct)
-    direction = "positive" if quote.day_change is not None and quote.day_change >= 0 else "negative"
-    return (
-        '<div class="sidebar-action-line">'
-        f'<span class="market">{escape(price)} '
-        f'<span class="{direction}">{escape(change)} ({escape(change_pct)})</span></span>'
-        "</div>"
-    )
+configure_page()
 
 
 def latest_indicator_value(indicators: pd.DataFrame, column: str) -> float | None:
@@ -649,299 +279,22 @@ def render_security_analysis(
             st.write(profile.summary)
 
 
-def render_sidebar() -> tuple[pd.DataFrame, dict, list[tuple[str, object]]]:
-    st.sidebar.title("追蹤清單")
-    if st.sidebar.button("登出", width="stretch"):
-        st.session_state.password_authenticated = False
-        st.session_state.login_failed = False
-        st.rerun()
-
-    if "holdings" not in st.session_state:
-        st.session_state.holdings = load_holdings()
-    if "latest_quotes" not in st.session_state:
-        st.session_state.latest_quotes = {}
-
-    sidebar_quotes = st.session_state.latest_quotes
-
-    st.sidebar.caption("數量填 0 代表只觀察。每張卡片可編輯、排序，並顯示即時行情。")
-
-    rows = []
-    quote_slots = []
-    pending_action = None
-    current_holdings = clean_holdings(st.session_state.holdings)
-    last_index = len(current_holdings) - 1
-    for index, row in enumerate(current_holdings.itertuples(index=False)):
-        row_key = str(row.ticker)
-        with st.sidebar.container(border=True):
-            st.markdown(
-                """
-                <div class="sidebar-row-guide">
-                    <span>標的</span><span>數量</span><span>買入價</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            input_cols = st.columns([1.2, 0.8, 0.86], gap=None, vertical_alignment="center")
-            ticker = input_cols[0].text_input(
-                "標的",
-                value=str(row.ticker),
-                label_visibility="collapsed",
-                key=f"ticker_input_{row_key}",
-            )
-            quantity = input_cols[1].number_input(
-                "數量",
-                min_value=0.0,
-                value=float(row.quantity),
-                step=1.0,
-                format="%.0f",
-                label_visibility="collapsed",
-                key=f"quantity_input_{row_key}",
-            )
-            purchase_price = input_cols[2].number_input(
-                "買入價",
-                min_value=0.0,
-                value=float(row.purchase_price),
-                step=0.01,
-                format="%.2f",
-                label_visibility="collapsed",
-                key=f"purchase_input_{row_key}",
-            )
-
-            clean_ticker = ticker.strip().upper()
-            quote = sidebar_quotes.get(clean_ticker)
-
-            action_cols = st.columns([1, 0.09, 0.09, 0.14], gap=None, vertical_alignment="center")
-            quote_slot = action_cols[0].empty()
-            quote_slot.markdown(sidebar_market_summary_html(clean_ticker, quote), unsafe_allow_html=True)
-            quote_slots.append((clean_ticker, quote_slot))
-            if action_cols[1].button(
-                "↑",
-                key=f"move_up_holding_{index}",
-                help="上移",
-                disabled=index == 0,
-                type="tertiary",
-                width="content",
-            ):
-                pending_action = ("up", index)
-            if action_cols[2].button(
-                "↓",
-                key=f"move_down_holding_{index}",
-                help="下移",
-                disabled=index == last_index,
-                type="tertiary",
-                width="content",
-            ):
-                pending_action = ("down", index)
-            if action_cols[3].button(
-                "刪",
-                key=f"delete_holding_{index}",
-                help="刪除這個標的",
-                type="tertiary",
-                width="content",
-            ):
-                pending_action = ("delete", index)
-
-            rows.append(
-                {
-                    "order": index + 1,
-                    "ticker": clean_ticker,
-                    "quantity": quantity,
-                    "purchase_price": purchase_price,
-                }
-            )
-
-    if pending_action is not None:
-        action, target_index = pending_action
-        if action == "delete":
-            rows.pop(target_index)
-        elif action == "up" and target_index > 0:
-            rows[target_index - 1], rows[target_index] = rows[target_index], rows[target_index - 1]
-        elif action == "down" and target_index < len(rows) - 1:
-            rows[target_index + 1], rows[target_index] = rows[target_index], rows[target_index + 1]
-        for order, item in enumerate(rows, start=1):
-            item["order"] = order
-        st.session_state.holdings = clean_holdings(pd.DataFrame(rows))
-        clear_sidebar_editor_state()
-        st.rerun()
-
-    holdings = clean_holdings(pd.DataFrame(rows))
-    st.session_state.holdings = holdings
-    quotes = {
-        ticker: sidebar_quotes[ticker]
-        for ticker in holdings["ticker"].tolist()
-        if ticker in sidebar_quotes
-    }
-
-    add_cols = st.sidebar.columns([0.68, 0.32])
-    new_ticker = add_cols[0].text_input(
-        "新增標的",
-        value="",
-        placeholder="例如 AAPL",
-        label_visibility="collapsed",
-        key="new_ticker_input",
-    )
-    if add_cols[1].button("新增", width="stretch"):
-        candidate = new_ticker.strip().upper()
-        if candidate:
-            next_row = {
-                "order": len(holdings) + 1,
-                "ticker": candidate,
-                "quantity": 0.0,
-                "purchase_price": 0.0,
-            }
-            st.session_state.holdings = clean_holdings(pd.concat([holdings, pd.DataFrame([next_row])]))
-            clear_sidebar_editor_state()
-            st.rerun()
-
-    if st.sidebar.button("儲存持倉", width="stretch"):
-        save_holdings(holdings)
-        st.sidebar.success("已儲存，下次開啟會自動載入。")
-
-    st.sidebar.divider()
-    st.sidebar.caption("價格資料來源：Yahoo Finance / yfinance。新聞來源：Yahoo奇摩股市。資料每次開啟頁面更新，並快取 30 分鐘。")
-
-    with st.sidebar.expander("API 計時紀錄", expanded=False):
-        log = read_timing_log()
-        if log.strip():
-            st.code(log, language=None)
-        else:
-            st.caption("尚無紀錄（快取命中時不會重新呼叫 API）")
-
-    return holdings, quotes, quote_slots
-
-
-def quote_currency(ticker: str, quote) -> str:
-    currency = (quote.currency if quote else None) or ("TWD" if ticker.endswith(".TW") else "USD")
-    return currency.upper()
-
-
-def twd_fx_rate(ticker: str, quote, fx_rate: float | None) -> float | None:
-    currency = quote_currency(ticker, quote)
-    if currency == "TWD":
-        return 1.0
-    if currency == "USD":
-        return fx_rate
-    return None
-
-
-def portfolio_weights(holdings: pd.DataFrame, quotes, fx_rate: float | None) -> dict[str, float]:
-    values: dict[str, float] = {}
-    for row in holdings.itertuples(index=False):
-        quote = quotes.get(row.ticker)
-        price = quote.price if quote else None
-        conversion = twd_fx_rate(row.ticker, quote, fx_rate)
-        values[row.ticker] = (
-            float(row.quantity) * float(price) * conversion
-            if price is not None and conversion is not None
-            else 0.0
-        )
-
-    total = sum(values.values())
-    if total <= 0:
-        return {ticker: 0.0 for ticker in holdings["ticker"]}
-    return {ticker: value / total for ticker, value in values.items()}
-
-
-def render_holdings_summary(holdings: pd.DataFrame, quotes, fx_rate: float | None) -> pd.DataFrame:
-    rows = []
-    weights = portfolio_weights(holdings, quotes, fx_rate)
-    for row in holdings.itertuples(index=False):
-        quote = quotes.get(row.ticker)
-        current_price = quote.price if quote else None
-        currency = quote_currency(row.ticker, quote)
-        conversion = twd_fx_rate(row.ticker, quote, fx_rate)
-        quantity = float(row.quantity)
-        purchase_price = float(row.purchase_price)
-        market_value = (
-            quantity * current_price * conversion
-            if current_price is not None and conversion is not None
-            else None
-        )
-        cost = (
-            quantity * purchase_price * conversion
-            if purchase_price > 0 and conversion is not None
-            else None
-        )
-        unrealized_gain = market_value - cost if market_value is not None and cost is not None else None
-        unrealized_return = unrealized_gain / cost if unrealized_gain is not None and cost not in (None, 0) else None
-        rows.append(
-            {
-                "名稱": ticker_display_name(row.ticker, quote),
-                "標的": row.ticker,
-                "幣別": currency,
-                "數量": quantity,
-                "買入價": purchase_price if purchase_price > 0 else None,
-                "現價": current_price,
-                "匯率": conversion,
-                "市值(TWD)": market_value,
-                "成本(TWD)": cost,
-                "未實現損益(TWD)": unrealized_gain,
-                "未實現報酬率": unrealized_return,
-                "配置比例": weights.get(row.ticker, 0.0),
-            }
-        )
-    return pd.DataFrame(rows).set_index("標的") if rows else pd.DataFrame()
-
-
-def render_position_metrics(holdings_summary: pd.DataFrame, fx_rate: float | None) -> None:
-    if holdings_summary.empty:
-        total_market_value = None
-        total_cost = None
-        total_gain = None
-        total_return = None
-    else:
-        total_market_value = holdings_summary["市值(TWD)"].dropna().sum()
-        total_cost = holdings_summary["成本(TWD)"].dropna().sum()
-        total_gain = (
-            total_market_value - total_cost
-            if total_market_value > 0 and total_cost > 0
-            else None
-        )
-        total_return = total_gain / total_cost if total_gain is not None and total_cost else None
-
-    cols = st.columns(5)
-    cols[0].metric("持有市值(TWD)", fmt_currency(float(total_market_value)) if total_market_value else "N/A")
-    cols[1].metric("投入成本(TWD)", fmt_currency(float(total_cost)) if total_cost else "N/A")
-    cols[2].metric("未實現損益(TWD)", fmt_currency(float(total_gain)) if total_gain is not None else "N/A")
-    cols[3].metric("未實現報酬率", fmt_percent(float(total_return)) if total_return is not None else "N/A")
-    cols[4].metric("USD/TWD", fmt_currency(fx_rate, "TWD"))
-
-
 def update_sidebar_quote_slots(quote_slots: list[tuple[str, object]], quotes) -> None:
     for ticker, slot in quote_slots:
         slot.markdown(sidebar_market_summary_html(ticker, quotes.get(ticker)), unsafe_allow_html=True)
 
 
-def render_dividend_summary(selected: list[str], quotes, dividends: dict[str, pd.Series]) -> pd.DataFrame:
-    rows = []
-    for ticker in selected:
-        quote = quotes.get(ticker)
-        currency = quote_currency(ticker, quote)
-        series = dividends.get(ticker, pd.Series(dtype=float))
-        latest = series.iloc[-1] if not series.empty else None
-        latest_date = series.index[-1].date().isoformat() if not series.empty else "N/A"
-        trailing_start = pd.Timestamp.today().tz_localize(None) - pd.Timedelta(days=365)
-        trailing_dividend = (
-            float(series.loc[series.index >= trailing_start].sum()) if not series.empty else None
-        )
-        dividend_yield = (
-            trailing_dividend / quote.price
-            if quote and quote.price not in (None, 0) and trailing_dividend is not None
-            else None
-        )
-        rows.append(
-            {
-                "名稱": ticker_display_name(ticker, quote),
-                "標的": ticker,
-                "幣別": currency,
-                "Trailing Annual Dividend": trailing_dividend,
-                "Dividend Yield": dividend_yield,
-                "Latest Dividend": latest,
-                "Latest Date": latest_date,
-            }
-        )
+def quote_has_price(quote) -> bool:
+    return quote is not None and quote.price is not None and quote.price == quote.price
 
-    return pd.DataFrame(rows).set_index("標的")
+
+def merge_quote_updates(previous_quotes: dict, updated_quotes: dict) -> dict:
+    merged = dict(previous_quotes)
+    for ticker, quote in updated_quotes.items():
+        previous = previous_quotes.get(ticker)
+        if quote_has_price(quote) or not quote_has_price(previous):
+            merged[ticker] = quote
+    return merged
 
 
 def render_news(news: list[dict[str, str]]) -> None:
@@ -1060,11 +413,16 @@ def main() -> None:
 
     load_status = st.status("正在準備投資儀表板...", expanded=True)
     load_status.write("更新追蹤清單即時報價與日漲跌。")
-    quotes = load_quotes(tickers)
+    previous_quotes = st.session_state.get("latest_quotes", {})
+    quotes = merge_quote_updates(previous_quotes, load_quotes(tickers))
     st.session_state.latest_quotes = quotes
     update_sidebar_quote_slots(quote_slots, quotes)
     load_status.write("取得 USD/TWD 匯率，換算台幣市值與損益。")
     fx_rate = load_fx_rate()
+    if fx_rate is None:
+        fx_rate = st.session_state.get("latest_fx_rate")
+    else:
+        st.session_state.latest_fx_rate = fx_rate
     load_status.update(label="核心資料已載入", state="complete", expanded=False)
 
     weights = portfolio_weights(holdings, quotes, fx_rate)
@@ -1076,7 +434,7 @@ def main() -> None:
 
     active_view = st.radio(
         "檢視",
-        ["持有資產", "觀察指標", "個股分析", "配息資訊", "新聞摘要"],
+        ["持有資產", "觀察指標", "個股分析", "配息資訊", "新聞摘要", "退休試算"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -1185,6 +543,10 @@ def main() -> None:
                 news = load_news(tickers)
                 news_status.update(label="新聞資料已載入", state="complete", expanded=False)
         render_news(news)
+
+    elif active_view == "退休試算":
+        total_market_value_twd = float(held_summary["市值(TWD)"].dropna().sum()) if not held_summary.empty else None
+        render_retirement_view(total_market_value_twd)
 
 
 if __name__ == "__main__":

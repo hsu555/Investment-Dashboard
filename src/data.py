@@ -6,8 +6,9 @@ import re
 import contextlib
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import io
+import json
 from pathlib import Path
 import time
 import xml.etree.ElementTree as ET
@@ -23,12 +24,12 @@ from .config import (
     CACHE_TTL_HISTORY,
     CACHE_TTL_NEWS,
     CACHE_TTL_PROFILE,
-    CACHE_TTL_QUOTES,
     FX_TICKER,
     YAHOO_TW_RSS_FEEDS,
 )
 
 YAHOO_SEARCH_URL = "https://query1.finance.yahoo.com/v1/finance/search"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 YAHOO_HEADERS = {
     "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.6",
     "User-Agent": "Mozilla/5.0 Investment Dashboard",
@@ -42,6 +43,7 @@ except Exception:
     pass
 
 TIMING_LOG = Path(__file__).resolve().parents[1] / "timing.log"
+QUOTE_CACHE_FILE = Path(__file__).resolve().parents[1] / "quote_cache.json"
 
 
 def clear_timing_log() -> None:
@@ -213,6 +215,45 @@ def _as_text(value: object) -> str | None:
     return text or None
 
 
+def _read_quote_cache() -> dict[str, object]:
+    try:
+        payload = json.loads(QUOTE_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _write_quote_cache(payload: dict[str, object]) -> None:
+    try:
+        QUOTE_CACHE_FILE.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
+def _quote_from_cache(ticker: str, cached: object) -> Quote | None:
+    if not isinstance(cached, dict):
+        return None
+    return Quote(
+        ticker=ticker,
+        price=_as_float(cached.get("price")),
+        previous_close=_as_float(cached.get("previous_close")),
+        day_change=_as_float(cached.get("day_change")),
+        day_change_pct=_as_float(cached.get("day_change_pct")),
+        currency=_as_text(cached.get("currency")) or _currency_from_ticker(ticker),
+        long_name=_as_text(cached.get("long_name")),
+        short_name=_as_text(cached.get("short_name")),
+        dividend_yield=_as_float(cached.get("dividend_yield")),
+        trailing_annual_dividend_rate=_as_float(cached.get("trailing_annual_dividend_rate")),
+    )
+
+
+def _quote_has_price(quote: Quote | None) -> bool:
+    return quote is not None and quote.price is not None and quote.price == quote.price
+
+
 def _info_value(info: dict[str, object], *keys: str) -> object:
     for key in keys:
         value = info.get(key)
@@ -263,6 +304,49 @@ def _quote_name_from_search(ticker: str) -> tuple[str | None, str | None]:
     long_name = _as_text(selected.get("longname") or selected.get("longName"))
     short_name = _as_text(selected.get("shortname") or selected.get("shortName"))
     return long_name, short_name
+
+
+def _chart_quote_snapshot(ticker: str) -> dict[str, object]:
+    """Fetch recent quote data from Yahoo's chart endpoint without crumb auth."""
+    with _timed(f"chart quote {ticker}") as meta:
+        try:
+            response = _http_get(
+                YAHOO_CHART_URL.format(ticker=ticker),
+                params={"range": "5d", "interval": "1d"},
+                timeout=8,
+                headers=YAHOO_HEADERS,
+            )
+            response.raise_for_status()
+            result = response.json().get("chart", {}).get("result", [])
+            meta["size"] = f"{len(response.content)} bytes"
+        except Exception:
+            meta["size"] = "error"
+            return {}
+
+    if not result:
+        return {}
+
+    chart = result[0]
+    chart_meta = chart.get("meta", {}) if isinstance(chart, dict) else {}
+    indicators = chart.get("indicators", {}) if isinstance(chart, dict) else {}
+    quotes = indicators.get("quote", []) if isinstance(indicators, dict) else []
+    quote_values = quotes[0] if quotes and isinstance(quotes[0], dict) else {}
+    closes = quote_values.get("close", []) if isinstance(quote_values, dict) else []
+    valid_closes = [_as_float(value) for value in closes]
+    valid_closes = [value for value in valid_closes if value is not None]
+
+    last_price = _as_float(chart_meta.get("regularMarketPrice")) or (valid_closes[-1] if valid_closes else None)
+    previous_close = _as_float(chart_meta.get("chartPreviousClose"))
+    if previous_close is None and len(valid_closes) >= 2:
+        previous_close = valid_closes[-2]
+
+    return {
+        "price": last_price,
+        "previous_close": previous_close,
+        "currency": _as_text(chart_meta.get("currency")),
+        "long_name": _as_text(chart_meta.get("longName")),
+        "short_name": _as_text(chart_meta.get("shortName")),
+    }
 
 
 def _clean_html(value: str) -> str:
@@ -377,7 +461,6 @@ def _currency_from_ticker(ticker: str) -> str:
     return "USD"
 
 
-@st.cache_data(ttl=CACHE_TTL_QUOTES, show_spinner=False)
 def load_quotes(tickers: tuple[str, ...]) -> dict[str, Quote]:
     """Load current quote metadata using one batch yf.download + parallel name searches."""
     # One batch request for all tickers' closing prices
@@ -418,16 +501,31 @@ def load_quotes(tickers: tuple[str, ...]) -> dict[str, Quote]:
                     if len(valid) >= 2:
                         prices_prev[ticker] = _as_float(valid.iloc[-2])
 
+    missing_price_tickers = [ticker for ticker in tickers if prices_last[ticker] is None]
+    chart_snapshots: dict[str, dict[str, object]] = {}
+    if missing_price_tickers:
+        with ThreadPoolExecutor(max_workers=min(len(missing_price_tickers), 8)) as executor:
+            futures = {ticker: executor.submit(_chart_quote_snapshot, ticker) for ticker in missing_price_tickers}
+            chart_snapshots = {ticker: fut.result() for ticker, fut in futures.items()}
+        for ticker, snapshot in chart_snapshots.items():
+            prices_last[ticker] = _as_float(snapshot.get("price"))
+            prices_prev[ticker] = _as_float(snapshot.get("previous_close"))
+
     # Fetch display names for all tickers in parallel
     with ThreadPoolExecutor(max_workers=min(len(tickers), 8)) as executor:
         name_futures = {ticker: executor.submit(_quote_name_from_search, ticker) for ticker in tickers}
         names = {ticker: fut.result() for ticker, fut in name_futures.items()}
 
     quotes: dict[str, Quote] = {}
+    cache_payload = _read_quote_cache()
+    cached_quotes = cache_payload.get("quotes", {})
     for ticker in tickers:
         last_price = prices_last[ticker]
         previous_close = prices_prev[ticker]
+        chart_snapshot = chart_snapshots.get(ticker, {})
         long_name, short_name = names.get(ticker, (None, None))
+        long_name = long_name or _as_text(chart_snapshot.get("long_name"))
+        short_name = short_name or _as_text(chart_snapshot.get("short_name"))
 
         day_change = None
         day_change_pct = None
@@ -441,12 +539,25 @@ def load_quotes(tickers: tuple[str, ...]) -> dict[str, Quote]:
             previous_close=previous_close,
             day_change=day_change,
             day_change_pct=day_change_pct,
-            currency=_currency_from_ticker(ticker),
+            currency=_as_text(chart_snapshot.get("currency")) or _currency_from_ticker(ticker),
             long_name=long_name,
             short_name=short_name,
             dividend_yield=None,
             trailing_annual_dividend_rate=None,
         )
+        if not _quote_has_price(quotes[ticker]) and isinstance(cached_quotes, dict):
+            cached_quote = _quote_from_cache(ticker, cached_quotes.get(ticker))
+            if _quote_has_price(cached_quote):
+                quotes[ticker] = cached_quote
+
+    fresh_quotes = {ticker: quote for ticker, quote in quotes.items() if _quote_has_price(quote)}
+    if fresh_quotes:
+        cache_payload["quotes"] = {
+            **(cached_quotes if isinstance(cached_quotes, dict) else {}),
+            **{ticker: asdict(quote) for ticker, quote in fresh_quotes.items()},
+        }
+        cache_payload["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        _write_quote_cache(cache_payload)
     return quotes
 
 
@@ -507,9 +618,20 @@ def load_security_profile(ticker: str) -> SecurityProfile:
     )
 
 
-@st.cache_data(ttl=CACHE_TTL_QUOTES, show_spinner=False)
 def load_fx_rate() -> float | None:
     """Load USD/TWD exchange rate using Yahoo Finance TWD=X."""
+    def cached_fx_rate() -> float | None:
+        return _as_float(_read_quote_cache().get("fx_rate"))
+
+    def remember_fx_rate(value: float | None) -> float | None:
+        if value is None:
+            return cached_fx_rate()
+        payload = _read_quote_cache()
+        payload["fx_rate"] = value
+        payload["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+        _write_quote_cache(payload)
+        return value
+
     with _timed("yf.download fx TWD=X 5d") as meta:
         try:
             history = yf.download(
@@ -522,26 +644,30 @@ def load_fx_rate() -> float | None:
             meta["size"] = f"{len(history)} rows" if not history.empty else "empty"
         except Exception:
             meta["size"] = "error"
-            return None
+            history = pd.DataFrame()
 
     if history.empty:
-        return None
+        snapshot = _chart_quote_snapshot(FX_TICKER)
+        return remember_fx_rate(_as_float(snapshot.get("price")))
 
     if isinstance(history.columns, pd.MultiIndex):
         if "Close" not in history.columns.get_level_values(0):
-            return None
+            snapshot = _chart_quote_snapshot(FX_TICKER)
+            return remember_fx_rate(_as_float(snapshot.get("price")))
         close = history["Close"]
         if isinstance(close, pd.DataFrame):
             close = close.iloc[:, 0]
     else:
         if "Close" not in history:
-            return None
+            snapshot = _chart_quote_snapshot(FX_TICKER)
+            return remember_fx_rate(_as_float(snapshot.get("price")))
         close = history["Close"]
 
     close = close.dropna()
     if close.empty:
-        return None
-    return _as_float(close.iloc[-1])
+        snapshot = _chart_quote_snapshot(FX_TICKER)
+        return remember_fx_rate(_as_float(snapshot.get("price")))
+    return remember_fx_rate(_as_float(close.iloc[-1]))
 
 
 @st.cache_data(ttl=CACHE_TTL_NEWS, show_spinner=False)
