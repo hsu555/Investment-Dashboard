@@ -25,3 +25,5 @@ data/
 exports/
 portfolio.json
 quote_cache.json
+target_allocations.json
+transactions.json

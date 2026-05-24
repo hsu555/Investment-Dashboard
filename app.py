@@ -7,8 +7,11 @@ import pandas as pd
 import streamlit as st
 
 from src.analytics import (
+    correlation_matrix,
     growth_curve,
     metrics_table,
+    portfolio_growth_curve,
+    portfolio_risk_metrics,
     technical_indicators,
     technical_signal_table,
     yearly_dividends,
@@ -16,6 +19,7 @@ from src.analytics import (
 from src.charts import (
     allocation_pie,
     comparison_chart,
+    correlation_heatmap,
     dividend_chart,
     growth_chart,
     momentum_chart,
@@ -43,6 +47,19 @@ from src.portfolio import (
 )
 from src.retirement_ui import render_retirement_view
 from src.sidebar import render_sidebar
+from src.holdings import clear_sidebar_editor_state, save_holdings
+from src.targets import load_target_allocations, rebalance_table, save_target_allocations
+from src.transactions import (
+    TRANSACTION_TYPE_LABELS,
+    holdings_from_transactions,
+    initial_transactions_from_holdings,
+    load_transactions,
+    save_transactions,
+    ticker_realized_summary,
+    transaction_summary,
+    transactions_for_display,
+    transactions_from_display,
+)
 from src.ui import (
     add_display_name_column,
     configure_page,
@@ -320,6 +337,166 @@ def render_news(news: list[dict[str, str]]) -> None:
         )
 
 
+def current_user_id() -> str | None:
+    current_user = st.session_state.get("current_user", {})
+    return current_user.get("id")
+
+
+def render_rebalance_view(held_summary: pd.DataFrame) -> None:
+    st.markdown("##### 目標配置與再平衡")
+    if held_summary.empty:
+        st.info("目前沒有持有部位，尚無法計算再平衡建議。")
+        return
+
+    tickers = held_summary.index.astype(str).tolist()
+    user_id = current_user_id()
+    targets_key = f"target_allocations_{'|'.join(tickers)}"
+    if targets_key not in st.session_state:
+        st.session_state[targets_key] = load_target_allocations(user_id, tickers)
+
+    targets = st.session_state[targets_key].copy()
+    editor = targets.assign(target_weight=targets["target_weight"] * 100).rename(columns={"ticker": "標的", "target_weight": "目標比例(%)"})
+    edited = st.data_editor(
+        editor,
+        width="stretch",
+        hide_index=True,
+        disabled=["標的"],
+        column_config={
+            "目標比例(%)": st.column_config.NumberColumn("目標比例(%)", min_value=0.0, max_value=100.0, step=1.0, format="%.1f"),
+        },
+        key="target_allocation_editor",
+    )
+    clean_targets = edited.rename(columns={"標的": "ticker", "目標比例(%)": "target_weight"})
+    clean_targets["target_weight"] = pd.to_numeric(clean_targets["target_weight"], errors="coerce").fillna(0.0) / 100
+    target_total = float(clean_targets["target_weight"].sum()) if "target_weight" in clean_targets else 0.0
+    cols = st.columns([0.34, 0.33, 0.33])
+    new_cash = cols[0].number_input("新增投入現金(TWD)", min_value=0.0, step=1000.0, value=0.0)
+    cols[1].metric("目標比例合計", fmt_percent(target_total))
+    if cols[2].button("儲存目標配置", type="primary", width="stretch"):
+        try:
+            save_target_allocations(clean_targets, user_id)
+            st.session_state[targets_key] = clean_targets
+            st.success("目標配置已儲存。")
+        except Exception as exc:
+            st.error(f"目標配置儲存失敗：{exc}")
+
+    if abs(target_total - 1.0) > 0.001:
+        st.warning("目標比例合計建議等於 100%，目前仍會依你輸入的比例計算。")
+
+    rebalanced = rebalance_table(held_summary, clean_targets, new_cash)
+    if rebalanced.empty:
+        return
+    display = rebalanced.copy()
+    for column in ["目前比例", "目標比例", "偏離比例"]:
+        display[column] = display[column].map(fmt_percent)
+    for column in ["市值(TWD)", "目標市值(TWD)", "需調整金額(TWD)"]:
+        display[column] = display[column].map(lambda value: fmt_currency(value, "TWD"))
+    display["估計股數"] = display["估計股數"].map(lambda value: fmt_number(value, 2))
+    st.dataframe(
+        display[["名稱", "目前比例", "目標比例", "偏離比例", "市值(TWD)", "目標市值(TWD)", "建議動作", "需調整金額(TWD)", "估計股數"]],
+        width="stretch",
+        height=280,
+    )
+
+
+def render_transactions_view(holdings: pd.DataFrame, quotes, fx_rate: float | None) -> None:
+    st.subheader("交易紀錄 / 現金流")
+    st.caption(
+        "目前持倉仍由側欄管理；這裡用來補交易流水帳，後續可支援 XIRR、已實現損益與投入本金曲線。"
+        "現金類紀錄可用數量 1、成交價填現金金額。"
+    )
+    user_id = current_user_id()
+    if "transactions" not in st.session_state:
+        st.session_state.transactions = load_transactions(user_id)
+
+    if st.session_state.transactions.empty:
+        st.info("尚無交易紀錄。可以先從目前持倉建立一批初始買入紀錄，再逐筆修正日期、匯率與手續費。")
+        if st.button("從目前持倉建立初始紀錄", type="primary"):
+            st.session_state.transactions = initial_transactions_from_holdings(holdings, quotes, fx_rate)
+            st.rerun()
+
+    edited = st.data_editor(
+        transactions_for_display(st.session_state.transactions),
+        width="stretch",
+        height=360,
+        num_rows="dynamic",
+        column_config={
+            "date": st.column_config.DateColumn("日期"),
+            "type": st.column_config.SelectboxColumn("類型", options=list(TRANSACTION_TYPE_LABELS.values()), required=True),
+            "ticker": st.column_config.TextColumn("標的"),
+            "quantity": st.column_config.NumberColumn("數量", min_value=0.0, step=1.0),
+            "price": st.column_config.NumberColumn("成交價", min_value=0.0, step=0.01),
+            "currency": st.column_config.TextColumn("幣別"),
+            "fx_rate": st.column_config.NumberColumn("匯率", min_value=0.0, step=0.0001, format="%.4f"),
+            "fee_twd": st.column_config.NumberColumn("手續費(TWD)", min_value=0.0, step=1.0),
+            "note": st.column_config.TextColumn("備註"),
+        },
+        key="transaction_editor",
+    )
+    edited_transactions = transactions_from_display(edited)
+    if st.button("儲存交易紀錄", type="primary"):
+        try:
+            save_transactions(edited_transactions, user_id)
+            st.session_state.transactions = edited_transactions
+            st.success("交易紀錄已儲存。")
+        except Exception as exc:
+            st.error(f"交易紀錄儲存失敗：{exc}")
+
+    sync_cols = st.columns([0.68, 0.32])
+    sync_cols[0].caption("同步會以「買入 / 賣出」推算淨股數與買入均價，並保留沒有交易紀錄的既有觀察標的。")
+    if sync_cols[1].button("同步到左側持倉", width="stretch"):
+        try:
+            synced_holdings = holdings_from_transactions(edited_transactions, holdings)
+            save_holdings(synced_holdings, user_id)
+            st.session_state.holdings = synced_holdings
+            clear_sidebar_editor_state()
+            st.success("已依交易紀錄更新左側持倉。")
+            st.rerun()
+        except Exception as exc:
+            st.error(f"同步持倉失敗：{exc}")
+
+    summary = transaction_summary(edited_transactions)
+    realized = ticker_realized_summary(edited_transactions)
+    if not summary.empty:
+        st.markdown("##### 現金流摘要")
+        display_summary = summary.copy()
+        for column in ["現金流_TWD", "手續費_TWD"]:
+            display_summary[column] = display_summary[column].map(lambda value: fmt_currency(value, "TWD"))
+        st.dataframe(display_summary, width="stretch", height=220)
+    if not realized.empty:
+        st.markdown("##### 標的彙總")
+        display_realized = realized.copy()
+        for column in ["買入成本(TWD)", "賣出收入(TWD)", "估計已實現損益(TWD)"]:
+            display_realized[column] = display_realized[column].map(lambda value: fmt_currency(value, "TWD"))
+        st.dataframe(display_realized, width="stretch", height=240)
+
+
+def render_portfolio_risk(prices: pd.DataFrame, weights: dict[str, float], held_tickers: list[str]) -> None:
+    st.markdown("##### 投資組合風險")
+    if not held_tickers:
+        st.info("目前沒有持有部位，尚無法計算投組風險。")
+        return
+
+    held_prices = prices[[ticker for ticker in held_tickers if ticker in prices]] if not prices.empty else pd.DataFrame()
+    if held_prices.empty:
+        st.info("持有標的缺少歷史價格，暫時無法計算投組風險。")
+        return
+
+    risk = portfolio_risk_metrics(held_prices, weights)
+    cols = st.columns(6)
+    cols[0].metric("總報酬率", fmt_percent(risk["total_return"]))
+    cols[1].metric("年化報酬率", fmt_percent(risk["cagr"]))
+    cols[2].metric("年化波動", fmt_percent(risk["annualized_volatility"]))
+    cols[3].metric("最大回撤", fmt_percent(risk["max_drawdown"]))
+    cols[4].metric("Sharpe", fmt_number(risk["sharpe_ratio"]))
+    cols[5].metric("最差單日", fmt_percent(risk["worst_day"]))
+
+    portfolio_growth = portfolio_growth_curve(held_prices, weights)
+    if not portfolio_growth.empty:
+        st.plotly_chart(growth_chart(portfolio_growth, title="投資組合成長曲線"), width="stretch")
+    st.plotly_chart(correlation_heatmap(correlation_matrix(held_prices, held_tickers)), width="stretch")
+
+
 def build_observation_data(tickers: tuple[str, ...]) -> dict[str, object]:
     prices = load_history(tickers, period="20y")
     metrics = metrics_table(prices) if not prices.empty else pd.DataFrame()
@@ -434,7 +611,7 @@ def main() -> None:
 
     active_view = st.radio(
         "檢視",
-        ["持有資產", "觀察指標", "個股分析", "配息資訊", "新聞摘要", "退休試算"],
+        ["持有資產", "交易紀錄", "觀察指標", "個股分析", "配息資訊", "新聞摘要", "退休試算"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -462,7 +639,11 @@ def main() -> None:
             for column in ["未實現報酬率", "配置比例"]:
                 formatted_holdings[column] = formatted_holdings[column].map(fmt_percent)
             st.dataframe(formatted_holdings, width="stretch", height=320)
+            render_rebalance_view(held_summary)
         st.caption(prefetch_status_caption(prefetch_jobs))
+
+    elif active_view == "交易紀錄":
+        render_transactions_view(holdings, quotes, fx_rate)
 
     elif active_view == "觀察指標":
         observation_data = wait_for_prefetch(prefetch_jobs, "observation", "觀察指標資料")
@@ -501,6 +682,7 @@ def main() -> None:
             width="stretch",
             height=300,
         )
+        render_portfolio_risk(prices, weights, held_tickers)
 
     elif active_view == "個股分析":
         security_data = wait_for_prefetch(prefetch_jobs, "security", "個股分析資料")

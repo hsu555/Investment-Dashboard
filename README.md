@@ -24,6 +24,9 @@
 - 年化波動率
 - 配息資訊與年度配息圖
 - 資產配置比例與圓餅圖
+- 目標配置與再平衡建議，可估算需調整金額與股數
+- 交易紀錄 / 現金流流水帳，可從目前持倉建立初始買入紀錄
+- 投資組合層級風險分析，包含年化報酬、波動、最大回撤、Sharpe 與相關係數
 - 美元 / 台幣匯率（Yahoo Finance `TWD=X`）
 - Yahoo奇摩股市繁體中文財經新聞摘要
 
@@ -61,6 +64,8 @@ default_username = "hsu555"
 ```
 
 第一次連上 Supabase 時，系統會自動建立預設使用者 `hsu555`，密碼使用 `dashboard_password`，並把現有 `portfolio.json` 的持股與觀察清單匯入這個帳號。後續新增使用者可在登入畫面的「新增使用者」建立。
+
+若是從舊版升級，請重新執行 `supabase_schema.sql`，新增 `target_allocations` 與 `transactions` 兩張表，才能在 Supabase 儲存目標配置與交易紀錄。本機開發未設定 Supabase 時，這兩項會分別寫入 `target_allocations.json` 與 `transactions.json`。
 
 `.streamlit/secrets.toml` 已在 `.gitignore` 中，不會提交到 GitHub。部署到 Streamlit Community Cloud 時，請到 app settings 的 Secrets 貼上同樣內容。請使用 Supabase Project Settings > API 的 `service_role` key，不需要提供 Supabase 帳號密碼，也不需要直接提供 Postgres 密碼。
 

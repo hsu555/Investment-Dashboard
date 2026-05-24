@@ -267,3 +267,85 @@ def save_retirement_settings(user_id: str, inputs: Any) -> None:
         data=json.dumps(payload),
         prefer="resolution=merge-duplicates,return=minimal",
     )
+
+
+def load_user_target_allocations(user_id: str) -> pd.DataFrame:
+    encoded = quote(user_id, safe="")
+    rows = _request(
+        "GET",
+        "target_allocations"
+        f"?user_id=eq.{encoded}"
+        "&select=ticker,target_weight"
+        "&order=ticker.asc",
+    )
+    return pd.DataFrame(rows or [])
+
+
+def save_user_target_allocations(user_id: str, targets: pd.DataFrame) -> None:
+    encoded = quote(user_id, safe="")
+    _request("DELETE", f"target_allocations?user_id=eq.{encoded}")
+    if targets.empty:
+        return
+
+    records = []
+    for row in targets.itertuples(index=False):
+        records.append(
+            {
+                "user_id": user_id,
+                "ticker": str(row.ticker),
+                "target_weight": float(row.target_weight),
+            }
+        )
+    _request("POST", "target_allocations", data=json.dumps(records), prefer="return=minimal")
+
+
+def load_user_transactions(user_id: str) -> pd.DataFrame:
+    encoded = quote(user_id, safe="")
+    rows = _request(
+        "GET",
+        "transactions"
+        f"?user_id=eq.{encoded}"
+        "&select=trade_date,transaction_type,ticker,quantity,price,currency,fx_rate,fee_twd,note"
+        "&order=trade_date.asc",
+    )
+    records = [
+        {
+            "date": row.get("trade_date"),
+            "type": row.get("transaction_type"),
+            "ticker": row.get("ticker"),
+            "quantity": row.get("quantity"),
+            "price": row.get("price"),
+            "currency": row.get("currency"),
+            "fx_rate": row.get("fx_rate"),
+            "fee_twd": row.get("fee_twd"),
+            "note": row.get("note"),
+        }
+        for row in (rows or [])
+    ]
+    return pd.DataFrame(records)
+
+
+def save_user_transactions(user_id: str, transactions: pd.DataFrame) -> None:
+    encoded = quote(user_id, safe="")
+    _request("DELETE", f"transactions?user_id=eq.{encoded}")
+    if transactions.empty:
+        return
+
+    records = []
+    for row in transactions.itertuples(index=False):
+        trade_date = row.date.isoformat() if hasattr(row.date, "isoformat") else str(row.date)
+        records.append(
+            {
+                "user_id": user_id,
+                "trade_date": trade_date,
+                "transaction_type": str(row.type),
+                "ticker": str(row.ticker),
+                "quantity": float(row.quantity),
+                "price": float(row.price),
+                "currency": str(row.currency),
+                "fx_rate": float(row.fx_rate),
+                "fee_twd": float(row.fee_twd),
+                "note": str(row.note),
+            }
+        )
+    _request("POST", "transactions", data=json.dumps(records), prefer="return=minimal")

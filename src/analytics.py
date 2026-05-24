@@ -7,7 +7,7 @@ import math
 import numpy as np
 import pandas as pd
 
-from .config import CAGR_WINDOWS, TRADING_DAYS
+from .config import CAGR_WINDOWS, RISK_FREE_RATE, TRADING_DAYS
 
 
 def growth_curve(prices: pd.DataFrame) -> pd.DataFrame:
@@ -81,6 +81,67 @@ def metrics_table(prices: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows).set_index("標的")
+
+
+def portfolio_return_series(prices: pd.DataFrame, weights: dict[str, float]) -> pd.Series:
+    if prices.empty:
+        return pd.Series(dtype=float)
+
+    usable_weights = {ticker: weight for ticker, weight in weights.items() if weight > 0 and ticker in prices}
+    total_weight = sum(usable_weights.values())
+    if total_weight <= 0:
+        return pd.Series(dtype=float)
+
+    normalized = {ticker: weight / total_weight for ticker, weight in usable_weights.items()}
+    returns = prices[list(normalized)].ffill().pct_change(fill_method=None).dropna(how="all")
+    if returns.empty:
+        return pd.Series(dtype=float)
+
+    weighted = returns.fillna(0.0).mul(pd.Series(normalized), axis=1).sum(axis=1)
+    return weighted.rename("投資組合")
+
+
+def portfolio_growth_curve(prices: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
+    returns = portfolio_return_series(prices, weights)
+    if returns.empty:
+        return pd.DataFrame()
+    return pd.DataFrame({"投資組合": (1 + returns).cumprod()})
+
+
+def portfolio_risk_metrics(prices: pd.DataFrame, weights: dict[str, float]) -> dict[str, float | None]:
+    returns = portfolio_return_series(prices, weights)
+    if returns.empty:
+        return {
+            "total_return": None,
+            "cagr": None,
+            "max_drawdown": None,
+            "annualized_volatility": None,
+            "sharpe_ratio": None,
+            "best_day": None,
+            "worst_day": None,
+        }
+
+    curve = (1 + returns).cumprod()
+    vol = float(returns.std() * math.sqrt(TRADING_DAYS)) if not returns.empty else None
+    annual_return = cagr(curve)
+    sharpe = (annual_return - RISK_FREE_RATE) / vol if annual_return is not None and vol not in (None, 0) else None
+    return {
+        "total_return": total_return(curve),
+        "cagr": annual_return,
+        "max_drawdown": max_drawdown(curve),
+        "annualized_volatility": vol,
+        "sharpe_ratio": float(sharpe) if sharpe is not None else None,
+        "best_day": float(returns.max()) if not returns.empty else None,
+        "worst_day": float(returns.min()) if not returns.empty else None,
+    }
+
+
+def correlation_matrix(prices: pd.DataFrame, tickers: list[str]) -> pd.DataFrame:
+    available = [ticker for ticker in tickers if ticker in prices]
+    if len(available) < 2:
+        return pd.DataFrame()
+    returns = prices[available].ffill().pct_change(fill_method=None).dropna(how="all")
+    return returns.corr()
 
 
 def yearly_dividends(dividends: dict[str, pd.Series]) -> pd.DataFrame:

@@ -35,6 +35,35 @@ create table if not exists public.retirement_settings (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.target_allocations (
+  user_id uuid not null references public.dashboard_users(id) on delete cascade,
+  ticker text not null,
+  target_weight numeric not null default 0,
+  updated_at timestamptz not null default now(),
+  primary key (user_id, ticker)
+);
+
+create table if not exists public.transactions (
+  id bigint generated always as identity primary key,
+  user_id uuid not null references public.dashboard_users(id) on delete cascade,
+  trade_date date not null,
+  transaction_type text not null,
+  ticker text not null default '',
+  quantity numeric not null default 0,
+  price numeric not null default 0,
+  currency text not null default 'TWD',
+  fx_rate numeric not null default 1,
+  fee_twd numeric not null default 0,
+  note text not null default '',
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists target_allocations_user_idx on public.target_allocations(user_id);
+create index if not exists transactions_user_date_idx on public.transactions(user_id, trade_date);
+
 alter table public.dashboard_users enable row level security;
 alter table public.holdings enable row level security;
 alter table public.retirement_settings enable row level security;
+alter table public.target_allocations enable row level security;
+alter table public.transactions enable row level security;

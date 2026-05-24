@@ -119,6 +119,41 @@ def comparison_chart(metrics: pd.DataFrame) -> go.Figure:
     return apply_layout(fig)
 
 
+def correlation_heatmap(correlation: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    if correlation.empty:
+        fig.add_annotation(
+            text="至少需要兩個持有標的才能計算相關係數",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            font=dict(size=16, color="#cbd5e1"),
+        )
+        fig.update_layout(title="持有標的相關係數")
+        return apply_layout(fig, height=420)
+
+    fig.add_trace(
+        go.Heatmap(
+            z=correlation.values,
+            x=correlation.columns,
+            y=correlation.index,
+            zmin=-1,
+            zmax=1,
+            colorscale=[
+                [0.0, "#fb7185"],
+                [0.5, "#111827"],
+                [1.0, "#22c55e"],
+            ],
+            colorbar=dict(tickformat=".0%"),
+            text=correlation.map(lambda value: f"{value:.2f}").values,
+            texttemplate="%{text}",
+            hovertemplate="<b>%{y} / %{x}</b><br>相關係數：%{z:.2f}<extra></extra>",
+        )
+    )
+    fig.update_layout(title="持有標的相關係數")
+    return apply_layout(fig, height=420)
+
+
 def dividend_chart(annual_dividends: pd.DataFrame) -> go.Figure:
     fig = px.bar(
         annual_dividends,
